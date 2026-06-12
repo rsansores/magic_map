@@ -58,6 +58,23 @@ between two foreign types anyway.
 [frunk]: https://crates.io/crates/frunk
 [prost-build]: https://crates.io/crates/prost-build
 
+### Thanks to o2o
+
+I've used [`o2o`] in many projects and it is awesome — if your types are
+yours to annotate, it's probably what you want. o2o does exactly what Rust
+philosophy always strives for: be strict, be explicit, do no "magic".
+
+But in a big, deliberately decoupled system it got hard for us: annotations
+pull layers toward each other (circular-dependency pressure), and the
+annotation volume grows with every pair of types. After 5k lines of code
+that exist only to map, you start to consider that some magic is not that
+bad. That's exactly why this crate is named `magic_map`.
+
+That said — the magic here comes from **conventions** (same name ⇒ same
+concept, strict leaves, fail loudly), and our conventions may not be the
+ones everyone needs or wants. If you think the library can do better, get in
+touch on the [issue tracker](https://github.com/rsansores/magic_map/issues).
+
 ## Quick start
 
 ```toml
