@@ -1,0 +1,31 @@
+[package]
+name = "magic_map"
+description = "Declaration-site, fallible struct/enum mapping — automap between types you don't own (DB rows, prost protos, DTOs) with strict, compile-checked conversions"
+keywords = ["mapping", "mapper", "dto", "conversion", "automap"]
+categories = ["rust-patterns", "development-tools::procedural-macro-helpers"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "../README.md"
+
+[dependencies]
+magic_map_macros = { version = "=0.1.0", path = "../magic_map_macros" }
+chrono = { version = "0.4", optional = true }
+rust_decimal = { version = "1", optional = true }
+serde_json = { version = "1", optional = true }
+uuid = { version = "1", optional = true }
+
+[features]
+default = []
+chrono = ["dep:chrono"]
+decimal = ["dep:rust_decimal"]
+json = ["dep:serde_json"]
+uuid = ["dep:uuid"]
+full = ["chrono", "decimal", "json", "uuid"]
+
+[dev-dependencies]
+# Integration tests exercise every leaf; enabling `full` on ourselves keeps
+# `cargo test` meaningful without --all-features.
+magic_map = { path = ".", features = ["full"] }
