@@ -29,3 +29,4 @@ full = ["chrono", "decimal", "json", "uuid"]
 # Integration tests exercise every leaf; enabling `full` on ourselves keeps
 # `cargo test` meaningful without --all-features.
 magic_map = { path = ".", features = ["full"] }
+strum = { version = "0.27", features = ["derive"] }

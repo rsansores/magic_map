@@ -8,16 +8,16 @@ strict, compile-checked conversions.
 use magic_map::{magic_map, MapInto};
 
 // The mapping is a standalone declaration — not an attribute on the type.
-magic_map!(db::License => dtos::LicenseResponse {
-    devices_used: 0,                          // absent from the source
-    license_type: src.license_type == "pro",  // custom expression
+magic_map!(db::Cat => api::CatDto {
+    adopted: false,                  // absent from the source
+    big: src.weight_kg > 30.0,       // custom expression
 });
 // Every other field auto-fills from the same-named source field through a
 // fallible leaf funnel: String↔Uuid, Decimal↔f64, Option/Vec wrappers,
 // nested mapped enums/structs… and a typo'd or newly-added field is a
 // COMPILE error, not a silently-unmapped field.
 
-let dto: dtos::LicenseResponse = license.map_into()?;
+let dto: api::CatDto = cat.map_into()?;
 ```
 
 ## Why another mapper?
@@ -65,35 +65,50 @@ between two foreign types anyway.
 magic_map = { version = "0.1", features = ["uuid", "chrono", "decimal"] }
 ```
 
+Two layers that never import each other, and an empty mapping declaration —
+all four fields automap through leaves:
+
 ```rust
 mod db {
     #[derive(magic_map::MagicMap)]
-    pub struct User {
+    pub struct Cat {
         pub id: uuid::Uuid,
         pub name: String,
         pub age: i32,
-        pub joined: chrono::DateTime<chrono::Utc>,
+        pub born: chrono::DateTime<chrono::Utc>,
     }
 }
 
-mod dtos {
-    #[derive(magic_map::MagicMap)]
-    pub struct UserResponse {
-        pub id: String,     // Uuid → String automaps (uuid leaf)
-        pub name: String,
-        pub age: i64,       // i32 → i64 widens losslessly, automaps
-        pub joined: String, // DateTime<Utc> → rfc3339 String (chrono leaf)
+mod api {
+    #[derive(Debug, magic_map::MagicMap)]
+    pub struct CatDto {
+        pub id: String,    // Uuid → String automaps (uuid leaf)
+        pub name: String,  // identity
+        pub age: i64,      // i32 → i64 widens losslessly, automaps
+        pub born: String,  // DateTime<Utc> → rfc3339 String (chrono leaf)
     }
 }
 
 mod mappers {
     use magic_map::magic_map;
-    // All four fields automap — the declaration is empty.
-    magic_map!(super::db::User => super::dtos::UserResponse);
+    // The only place that knows both layers.
+    magic_map!(super::db::Cat => super::api::CatDto);
 }
 
 use magic_map::MapInto;
-let dto: dtos::UserResponse = user.map_into()?;
+
+let dto: api::CatDto = db::Cat {
+    id: uuid::Uuid::nil(),
+    name: "Misifu".into(),
+    age: 3,
+    born: "2024-01-15T10:30:00Z".parse().unwrap(),
+}
+.map_into()?;
+
+assert_eq!(dto.id, "00000000-0000-0000-0000-000000000000");
+assert_eq!(dto.name, "Misifu");
+assert_eq!(dto.age, 3_i64);
+assert_eq!(dto.born, "2024-01-15T10:30:00+00:00");
 ```
 
 The derive is **content-free metadata**: it publishes the type's own field
@@ -103,26 +118,84 @@ generated proto in a workspace.
 
 ## Grammar tour
 
+Every example below is mirrored in [`magic_map/tests/readme.rs`](magic_map/tests/readme.rs),
+so what the README claims is what CI compiles and runs.
+
 ### impl form
 
 Generates `impl MapFrom<Src> for Dest`. Legal when your crate owns `Src` or
-`Dest` (the usual db→dto / dto→db case):
+`Dest` (the usual db→dto / dto→db case). Override a field when it is absent
+from the source or needs an expression; everything else automaps:
 
 ```rust
-magic_map!(db::License => dtos::LicenseResponse {
-    devices_used: 0,                          // dest field absent from src
-    license_type: src.license_type == "pro",  // expression over `src`
+mod db {
+    #[derive(magic_map::MagicMap)]
+    pub struct Dog {
+        pub name: String,
+        pub weight_kg: f32,
+    }
+}
+
+mod api {
+    #[derive(Debug, magic_map::MagicMap)]
+    pub struct DogDto {
+        pub name: String,   // automaps (identity)
+        pub weight_kg: f64, // automaps (f32 → f64 widens)
+        pub big: bool,      // absent from the source → must be overridden
+    }
+}
+
+magic_map!(db::Dog => api::DogDto {
+    big: src.weight_kg > 30.0,
 });
+
+let dto: api::DogDto = db::Dog { name: "Rex".into(), weight_kg: 38.5 }.map_into()?;
+assert_eq!(dto.name, "Rex");
+assert!(dto.big);
 ```
+
+Forgetting `big` would not compile (`missing field`), and overriding a field
+that doesn't exist on `DogDto` is rejected by the macro — nothing silently
+disappears in either direction.
 
 ### fn form
 
-Generates a plain `pub fn name(src: Src) -> Result<Dest, MappingError>`. Use
-it when **neither** type is local (db→proto in a service crate) and the orphan
-rule forbids any impl:
+When **neither** type is local — `wire::Lion` comes out of prost codegen,
+`db::Lion` out of the ORM, and you're mapping them in a neutral service
+crate — the orphan rule forbids any trait impl. The fn form generates a plain
+function instead:
 
 ```rust
-magic_map!(pub fn equipment_to_proto: db::Equipment => proto::Equipment);
+mod wire {
+    // The export attribute is only needed because BOTH `Lion`s live in this
+    // one example crate — in the real layering they're in different crates.
+    #[derive(magic_map::MagicMap)]
+    #[magic_map(export = "WireLion")]
+    pub struct Lion {
+        pub id: String,
+        pub name: String,
+    }
+}
+
+mod db {
+    #[derive(Debug, magic_map::MagicMap)]
+    pub struct Lion {
+        pub id: uuid::Uuid, // String → Uuid parses strictly
+        pub name: String,
+    }
+}
+
+magic_map!(pub fn lion_to_db: wire::Lion => db::Lion);
+
+let row = lion_to_db(wire::Lion {
+    id: "67e55044-10b1-426f-9247-bb680e5fe0c8".into(),
+    name: "Simba".into(),
+})?;
+assert_eq!(row.name, "Simba");
+
+// Strict by default: garbage is an Err, not a Uuid::nil().
+let bad = lion_to_db(wire::Lion { id: "not-a-uuid".into(), name: "?".into() });
+assert!(bad.is_err());
 ```
 
 ### `let` preludes
@@ -130,30 +203,86 @@ magic_map!(pub fn equipment_to_proto: db::Equipment => proto::Equipment);
 Shared derivations that feed more than one destination field:
 
 ```rust
-magic_map!(pub fn span_stats: Span => SpanStats {
+mod geom {
+    #[derive(magic_map::MagicMap)]
+    pub struct Span {
+        pub start: i64,
+        pub end: i64,
+    }
+
+    #[derive(Debug, magic_map::MagicMap)]
+    pub struct SpanStats {
+        pub width: i64,
+        pub midpoint: i64,
+    }
+}
+
+magic_map!(pub fn span_stats: geom::Span => geom::SpanStats {
     let width = src.end - src.start;
     width: width,
     midpoint: src.start + width / 2,
 });
+
+let stats = span_stats(geom::Span { start: 10, end: 20 })?;
+assert_eq!(stats.width, 10);
+assert_eq!(stats.midpoint, 15);
 ```
 
 ### Tuple sources
 
-`impl MapFrom<(A, B, ...)> for Dest` — call sites do
-`(a, b).map_into()?`. Plain non-generic struct elements are **open**: they
-must derive `MagicMap` and their fields join the auto-match. Generic types,
-references and primitives are **opaque**: reachable only as `src.N` in
-overrides. A destination field found in exactly one open element automaps;
-found in several (or none) is a compile error asking for an override:
+`impl MapFrom<(A, B, ...)> for Dest` — call sites do `(a, b).map_into()?`.
+Plain non-generic struct elements are **open**: they must derive `MagicMap`
+and their fields join the auto-match. Generic types, references and
+primitives are **opaque**: reachable only as `src.N` in overrides.
 
 ```rust
-magic_map!((db::License, db::Owner, i64) => dtos::LicenseCard {
-    id: src.1.id,            // `id` exists in both License and Owner → explicit
-    devices_used: src.2 as i32,
+mod db {
+    #[derive(magic_map::MagicMap)]
+    pub struct Cat {
+        pub id: i64,
+        pub name: String,
+        pub age: i32,
+    }
+
+    #[derive(magic_map::MagicMap)]
+    pub struct Owner {
+        pub id: i64,        // collides with Cat::id
+        pub name: String,   // collides with Cat::name
+    }
+}
+
+mod api {
+    #[derive(Debug, magic_map::MagicMap)]
+    pub struct AdoptionCard {
+        pub id: i64,
+        pub name: String,
+        pub age: i32,
+        pub note: Option<String>,
+    }
+}
+
+magic_map!((db::Cat, db::Owner, Option<String>) => api::AdoptionCard {
+    id: src.1.id,     // `id` exists in BOTH Cat and Owner → explicit pick
+    name: src.0.name, // same for `name`
+    note: src.2,      // exists in neither struct → from the opaque element
 });
-// `name` automaps from Owner, `max_devices` from License — each is
-// unambiguous.
+// `age` automaps — exactly one open element (Cat) has it.
+
+let card: api::AdoptionCard = (
+    db::Cat { id: 7, name: "Misifu".into(), age: 3 },
+    db::Owner { id: 99, name: "Ricardo".into() },
+    Some("indoor only".to_string()),
+)
+    .map_into()?;
+
+assert_eq!(card.id, 99);       // picked from Owner
+assert_eq!(card.name, "Misifu"); // picked from Cat
+assert_eq!(card.age, 3);       // automapped, unambiguous
+assert_eq!(card.note.as_deref(), Some("indoor only"));
 ```
+
+A field found in several open elements (or in none) without an override is a
+compile error naming the field and the candidates — never a silent pick.
 
 A single by-reference source uses a 1-tuple: `magic_map!((&Ctx,) => Dest {...})`.
 
@@ -166,37 +295,142 @@ proto3 zero variant `Unspecified` folds to the destination's declared
 `#[default]`:
 
 ```rust
-magic_map!(db::Status => dtos::StatusDto);          // same names
-magic_map!(pub fn kind_to_wire: DbKind => WireKind {
-    Integer => Int32,                                // explicit renames…
-    Text    => String,                               // …the rest pair by name
+mod wire {
+    // prost-style: proto3 forces a zero variant. (The export attribute is
+    // only needed because both `Species` live in this one example crate.)
+    #[derive(magic_map::MagicMap)]
+    #[magic_map(export = "WireSpecies")]
+    pub enum Species {
+        Unspecified,
+        Cat,
+        Dog,
+        BigCat,
+    }
+}
+
+mod db {
+    #[derive(Debug, Default, PartialEq, magic_map::MagicMap)]
+    pub enum Species {
+        #[default]
+        Cat,
+        Dog,
+        Lion,
+    }
+}
+
+magic_map!(pub fn species_to_db: wire::Species => db::Species {
+    BigCat => Lion, // explicit rename; the rest pair by name
 });
+
+assert_eq!(species_to_db(wire::Species::BigCat)?, db::Species::Lion); // renamed
+assert_eq!(species_to_db(wire::Species::Dog)?, db::Species::Dog);     // same name
+assert_eq!(species_to_db(wire::Species::Unspecified)?, db::Species::Cat); // zero variant → #[default]
 ```
+
+If `wire::Species` grows a `Hamster` variant tomorrow, this declaration stops
+compiling until you decide what `Hamster` maps to — the drift can't ship.
 
 ### The `..Default::default()` optionality adaptor
 
 For sparse create/update models, a trailing `..Default::default()` makes the
-mapping default-tolerant (the destination must implement `Default` — put
-business defaults **on the model**, e.g. with [`smart-default`]):
+mapping default-tolerant. The destination must implement `Default` — put
+business defaults **on the model** (e.g. with [`smart-default`]), and every
+`unwrap_or(business_default)` line disappears from your mappers:
 
 ```rust
-magic_map!(dtos::CreateLicenseRequest => db::CreateLicense { ..Default::default() });
+mod api {
+    #[derive(magic_map::MagicMap)]
+    pub struct CreateCatRequest {
+        pub name: String,
+        pub lives: Option<i32>,   // optional on the wire
+        pub note: Option<String>,
+    }
+}
+
+mod db {
+    #[derive(Debug, magic_map::MagicMap)]
+    pub struct CreateCat {
+        pub name: String,
+        pub lives: i32,           // required in the row
+        pub note: Option<String>,
+        pub status: String,       // not on the wire at all
+    }
+
+    impl Default for CreateCat {
+        fn default() -> Self {
+            CreateCat {
+                name: String::new(),
+                lives: 9,                // the business default lives HERE
+                note: None,
+                status: "new".into(),
+            }
+        }
+    }
+}
+
+magic_map!(api::CreateCatRequest => db::CreateCat { ..Default::default() });
+
+let row: db::CreateCat = api::CreateCatRequest {
+    name: "Misifu".into(),
+    lives: None,
+    note: None,
+}
+.map_into()?;
+
+assert_eq!(row.name, "Misifu"); // plain funnel
+assert_eq!(row.lives, 9);       // None → business default from the model
+assert_eq!(row.note, None);     // Option → Option: None stays None
+assert_eq!(row.status, "new");  // absent from the request → Default::default()
 ```
 
 Three behaviors compose, picked automatically per field:
 
 1. `Option<S>` source → required dest: unwrap through the funnel; `None`
-   falls back to the **default instance's field value** — every
-   `unwrap_or(business_default)` line disappears.
+   falls back to the default instance's field value (`lives: 9` above).
 2. `Option → Option`: stays a plain funnel, so `None → None` — an optional
    destination never gets a value invented.
 3. Plain source → `Option<U>` dest: funnel and wrap in `Some` ("set"
-   semantics). If `None` means "don't touch" on your patch models, keep
-   explicit wraps there.
+   semantics), still strict on the way:
 
-Destination fields absent from every source come from `Default::default()`.
+```rust
+mod seen {
+    #[derive(magic_map::MagicMap)]
+    pub struct CatSeen {
+        pub chip_id: String,
+        pub weight_kg: f32,
+    }
+
+    #[derive(Debug, Default, magic_map::MagicMap)]
+    pub struct CatPatch {
+        pub chip_id: Option<uuid::Uuid>, // String funnels to Uuid, wraps in Some
+        pub weight_kg: Option<f64>,      // f32 widens to f64, wraps in Some
+    }
+}
+
+magic_map!(seen::CatSeen => seen::CatPatch { ..Default::default() });
+
+let patch: seen::CatPatch = seen::CatSeen {
+    chip_id: "67e55044-10b1-426f-9247-bb680e5fe0c8".into(),
+    weight_kg: 4.2,
+}
+.map_into()?;
+assert!(patch.chip_id.is_some());
+
+// Still strict: a bad chip_id is an Err — never Some(Uuid::nil()).
+let bad: Result<seen::CatPatch, _> = seen::CatSeen {
+    chip_id: "not-a-uuid".into(),
+    weight_kg: 4.2,
+}
+.map_into();
+assert!(bad.is_err());
+```
+
+If `None` means "don't touch" on your patch models, keep explicit `Some(...)`
+wraps in those mappers instead.
+
 Use the trailer deliberately: it trades the missing-field compile error for
-defaulting.
+defaulting. Without it, `CreateCat`'s `status` field would have been a compile
+error asking for an override.
 
 [`smart-default`]: https://crates.io/crates/smart-default
 
@@ -219,12 +453,20 @@ visible.
 
 ### Your own leaves
 
-Declare them in the crate that owns the type — they then automap everywhere:
+Declare them in the crate that owns the type — they then automap everywhere.
+The macros pair naturally with [strum]'s `Display`/`EnumString` derives:
 
 ```rust
-magic_map::map_identity!(MyEnum);   // MyEnum → MyEnum (model→model moves)
-magic_map::map_display!(MyEnum);    // MyEnum → String (pairs with strum Display)
-magic_map::map_parse!(MyEnum);      // String → MyEnum, strict (strum EnumString)
+#[derive(strum::Display, strum::EnumString, magic_map::MagicMap)]
+pub enum Species {
+    Cat,
+    Dog,
+    Lion,
+}
+
+magic_map::map_identity!(Species); // Species → Species (model→model moves)
+magic_map::map_display!(Species);  // Species → String fields automap
+magic_map::map_parse!(Species);    // String → Species fields automap, strictly
 
 // Or hand-write any pair:
 impl magic_map::MapFrom<MyWireTimestamp> for chrono::DateTime<chrono::Utc> {
@@ -233,6 +475,8 @@ impl magic_map::MapFrom<MyWireTimestamp> for chrono::DateTime<chrono::Utc> {
     }
 }
 ```
+
+[strum]: https://crates.io/crates/strum
 
 ## prost / generated-code recipe
 
