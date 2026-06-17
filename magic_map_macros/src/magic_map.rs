@@ -42,8 +42,24 @@ pub fn derive(input: DeriveInput) -> Result<TokenStream, syn::Error> {
     let shape = match &input.data {
         Data::Struct(d) => match &d.fields {
             Fields::Named(named) => {
-                let fields = named.named.iter().map(|f| f.ident.as_ref().unwrap());
-                quote! { @struct [ #(#fields),* ] }
+                let fields: Vec<_> = named
+                    .named
+                    .iter()
+                    .map(|f| f.ident.as_ref().unwrap())
+                    .collect();
+                // Use @vstruct (instead of @struct) when any field carries
+                // #[validate(...)], so __magic_map_expand! knows to call
+                // validator::Validate::validate(&result)? after construction.
+                let kind = if named
+                    .named
+                    .iter()
+                    .any(|f| f.attrs.iter().any(|a| a.path().is_ident("validate")))
+                {
+                    quote! { vstruct }
+                } else {
+                    quote! { struct }
+                };
+                quote! { @#kind [ #(#fields),* ] }
             }
             _ => return Ok(TokenStream::new()),
         },
@@ -194,6 +210,9 @@ pub fn front(input: MagicMapInput) -> TokenStream {
 
 struct Shape {
     is_enum: bool,
+    /// True when the destination struct's schema was emitted as `@vstruct`
+    /// because some field carries `#[validate(...)]`.
+    validated: bool,
     names: Vec<Ident>,
 }
 
@@ -208,6 +227,8 @@ fn parse_shape(input: ParseStream) -> syn::Result<Shape> {
         .collect();
     Ok(Shape {
         is_enum: kind == "enum",
+        // @vstruct signals "struct with #[validate(...)] fields"; plain @struct does not.
+        validated: kind == "vstruct",
         names,
     })
 }
@@ -621,7 +642,18 @@ pub fn expand(raw: TokenStream2, input: ExpandInput) -> Result<TokenStream, syn:
             quote! { let __magic_fb = <#dest as ::core::default::Default>::default(); }
         });
         let trailer = defaulted.then(|| quote! { ..::core::default::Default::default() });
-        quote! { #prelude #(#lets)* ::core::result::Result::Ok(#dest { #(#assigns,)* #trailer }) }
+        if dest_shape.validated {
+            quote! {
+                #prelude
+                #(#lets)*
+                let __magic_result = #dest { #(#assigns,)* #trailer };
+                ::validator::Validate::validate(&__magic_result)
+                    .map_err(::magic_map::MappingError::Validation)?;
+                ::core::result::Result::Ok(__magic_result)
+            }
+        } else {
+            quote! { #prelude #(#lets)* ::core::result::Result::Ok(#dest { #(#assigns,)* #trailer }) }
+        }
     };
 
     Ok(match func {

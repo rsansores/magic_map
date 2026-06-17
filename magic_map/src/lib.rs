@@ -83,13 +83,26 @@ pub use magic_map_macros::__magic_map_expand;
 /// The single error surfaced by every mapping. Layer error types convert from
 /// it once (e.g. `ApiError: From<MappingError>`), so call sites just bubble
 /// with `?`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Validation` is only present when the `validate` feature is enabled and the
+/// destination struct has `#[validate(...)]` field annotations.
+#[derive(Debug, Clone, PartialEq)]
 pub enum MappingError {
-    InvalidUuid { field: &'static str },
-    OutOfRange { field: &'static str },
-    Parse { field: &'static str },
-    Missing { field: &'static str },
+    InvalidUuid {
+        field: &'static str,
+    },
+    OutOfRange {
+        field: &'static str,
+    },
+    Parse {
+        field: &'static str,
+    },
+    Missing {
+        field: &'static str,
+    },
     Custom(String),
+    #[cfg(feature = "validate")]
+    Validation(validator::ValidationErrors),
 }
 
 impl fmt::Display for MappingError {
@@ -100,6 +113,8 @@ impl fmt::Display for MappingError {
             MappingError::Parse { field } => write!(f, "parse error in `{field}`"),
             MappingError::Missing { field } => write!(f, "missing value for `{field}`"),
             MappingError::Custom(m) => write!(f, "{m}"),
+            #[cfg(feature = "validate")]
+            MappingError::Validation(e) => write!(f, "validation failed: {e}"),
         }
     }
 }

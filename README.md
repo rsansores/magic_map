@@ -451,18 +451,83 @@ error asking for an override.
 
 [`smart-default`]: https://crates.io/crates/smart-default
 
+### Automatic field validation
+
+When the destination struct derives [`validator::Validate`][validator] and
+annotates fields with `#[validate(...)]`, the mapping automatically calls
+`.validate()` on the constructed value before returning it — no change at the
+call site is needed:
+
+```rust
+use validator::Validate;
+
+mod api {
+    #[derive(magic_map::MagicMap)]
+    pub struct CreateUserRequest {
+        pub name: String,
+        pub email: String,
+        pub age: i32,
+    }
+}
+
+mod db {
+    use validator::Validate;
+
+    #[derive(Debug, Validate, magic_map::MagicMap)]
+    pub struct NewUser {
+        #[validate(length(min = 1, max = 100))]
+        pub name: String,
+        #[validate(email)]
+        pub email: String,
+        pub age: i64,
+    }
+}
+
+magic_map!(api::CreateUserRequest => db::NewUser);
+
+// Valid input → Ok
+let user: db::NewUser = api::CreateUserRequest {
+    name: "Alice".into(),
+    email: "alice@example.com".into(),
+    age: 30,
+}
+.map_into()?;
+
+// Invalid input → Err(MappingError::Validation(...))
+let bad: Result<db::NewUser, _> = api::CreateUserRequest {
+    name: "Alice".into(),
+    email: "not-an-email".into(),
+    age: 30,
+}
+.map_into();
+assert!(matches!(bad, Err(magic_map::MappingError::Validation(_))));
+```
+
+Enable the feature in `Cargo.toml`:
+
+```toml
+magic_map = { version = "0.1", features = ["validate"] }
+```
+
+Validation runs after all field conversions succeed — a type error (e.g. a bad
+UUID parse) surfaces its own `MappingError` variant before `.validate()` is
+ever called.
+
+[validator]: https://crates.io/crates/validator
+
 ## Leaves
 
 A *leaf* is a `MapFrom` impl for a known type pair. Identities for primitives
 and `String` ship always; third-party leaves are feature-gated:
 
-| feature   | leaves |
-|-----------|--------|
-| `uuid`    | `Uuid` identity, `String↔Uuid` (strict parse) |
-| `chrono`  | date/time identities, `DateTime<Utc>↔String` (rfc3339), `NaiveDate↔String` (ISO-8601) |
-| `decimal` | `Decimal` identity, `Decimal↔f64` / `Decimal↔String` (strict — NaN/∞ error) |
-| `json`    | `serde_json::Value` identity |
-| `full`    | all of the above |
+| feature    | leaves / behavior |
+|------------|-------------------|
+| `uuid`     | `Uuid` identity, `String↔Uuid` (strict parse) |
+| `chrono`   | date/time identities, `DateTime<Utc>↔String` (rfc3339), `NaiveDate↔String` (ISO-8601) |
+| `decimal`  | `Decimal` identity, `Decimal↔f64` / `Decimal↔String` (strict — NaN/∞ error) |
+| `json`     | `serde_json::Value` identity |
+| `validate` | `MappingError::Validation` variant; auto-validates destinations with `#[validate(...)]` fields |
+| `full`     | all of the above |
 
 Lossless integer widenings (`u8→u16…i64`, `i32→i64`, `f32→f64`) automap;
 narrowing stays an explicit `as` cast in an override, where the lossiness is

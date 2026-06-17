@@ -387,6 +387,59 @@ fn wrap_tier() -> Result<(), MappingError> {
     Ok(())
 }
 
+// ── Automatic field validation ───────────────────────────────────────────────
+
+mod validation {
+    pub mod api {
+        #[derive(magic_map::MagicMap)]
+        pub struct CreateUserRequest {
+            pub name: String,
+            pub email: String,
+            pub age: i32,
+        }
+    }
+
+    pub mod db {
+        use validator::Validate;
+
+        #[derive(Debug, Validate, magic_map::MagicMap)]
+        pub struct NewUser {
+            #[validate(length(min = 1, max = 100))]
+            pub name: String,
+            #[validate(email)]
+            pub email: String,
+            pub age: i64,
+        }
+    }
+
+    use magic_map::magic_map;
+    magic_map!(api::CreateUserRequest => db::NewUser);
+}
+
+#[test]
+fn validation() -> Result<(), MappingError> {
+    use validation::{api, db};
+
+    let user: db::NewUser = api::CreateUserRequest {
+        name: "Alice".into(),
+        email: "alice@example.com".into(),
+        age: 30,
+    }
+    .map_into()?;
+    assert_eq!(user.name, "Alice");
+    assert_eq!(user.age, 30_i64);
+
+    // Invalid input → Err(MappingError::Validation(...))
+    let bad: Result<db::NewUser, _> = api::CreateUserRequest {
+        name: "Alice".into(),
+        email: "not-an-email".into(),
+        age: 30,
+    }
+    .map_into();
+    assert!(matches!(bad, Err(magic_map::MappingError::Validation(_))));
+    Ok(())
+}
+
 // ── Your own leaves ──────────────────────────────────────────────────────────
 
 mod leaves {

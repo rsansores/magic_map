@@ -477,6 +477,60 @@ fn tuple_all_overridden_needs_no_schemas() {
     assert_eq!(h.reason, "r");
 }
 
+mod validated {
+    use magic_map::MagicMap;
+    use validator::Validate;
+
+    #[derive(MagicMap)]
+    pub struct RawInput {
+        pub name: String,
+        pub email: String,
+    }
+
+    #[derive(Debug, Validate, MagicMap)]
+    pub struct ValidatedDto {
+        #[validate(length(min = 1, max = 50))]
+        pub name: String,
+        #[validate(email)]
+        pub email: String,
+    }
+}
+
+magic_map!(validated::RawInput => validated::ValidatedDto);
+
+#[test]
+fn validated_dest_passes_when_data_is_valid() {
+    let dto: validated::ValidatedDto = validated::RawInput {
+        name: "Alice".into(),
+        email: "alice@example.com".into(),
+    }
+    .map_into()
+    .unwrap();
+    assert_eq!(dto.name, "Alice");
+}
+
+#[test]
+fn validated_dest_errors_when_data_fails_constraints() {
+    // Empty name violates length(min = 1).
+    let result: Result<validated::ValidatedDto, _> = validated::RawInput {
+        name: "".into(),
+        email: "alice@example.com".into(),
+    }
+    .map_into();
+    assert!(
+        matches!(result, Err(MappingError::Validation(_))),
+        "expected Validation error, got {result:?}",
+    );
+
+    // Invalid email violates #[validate(email)].
+    let result2: Result<validated::ValidatedDto, _> = validated::RawInput {
+        name: "Alice".into(),
+        email: "not-an-email".into(),
+    }
+    .map_into();
+    assert!(matches!(result2, Err(MappingError::Validation(_))));
+}
+
 #[test]
 fn leaf_conversions() {
     let u = Uuid::map_from("00000000-0000-0000-0000-000000000000".to_string()).unwrap();
