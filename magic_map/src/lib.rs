@@ -60,13 +60,14 @@
 //!
 //! Leaf conversions for third-party types are opt-in:
 //!
-//! | feature   | leaves                                                           |
-//! |-----------|------------------------------------------------------------------|
-//! | `uuid`    | `Uuid` identity, `String↔Uuid` (strict parse)                     |
-//! | `chrono`  | date/time identities, `DateTime<Utc>↔String` (rfc3339), `NaiveDate↔String` (ISO-8601) |
-//! | `decimal` | `Decimal` identity, `Decimal↔f64`/`String` (strict, no NaN/∞)     |
-//! | `json`    | `serde_json::Value` identity                                     |
-//! | `full`    | all of the above                                                 |
+//! | feature    | leaves / behavior                                                        |
+//! |------------|--------------------------------------------------------------------------|
+//! | `uuid`     | `Uuid` identity, `String↔Uuid` (strict parse)                             |
+//! | `chrono`   | date/time identities, `DateTime<Utc>↔String` (rfc3339), `NaiveDate↔String` (ISO-8601) |
+//! | `decimal`  | `Decimal` identity, `Decimal↔f64`/`String` (strict, no NaN/∞)             |
+//! | `json`     | `serde_json::Value` identity                                             |
+//! | `validate` | `MappingError::Validation` variant; auto-validates destinations with `#[validate(...)]` fields |
+//! | `full`     | all of the above                                                         |
 //!
 //! Leaves for your **own** types are declared with [`map_identity!`],
 //! [`map_display!`], [`map_parse!`], or a plain `MapFrom` impl in the crate
@@ -87,6 +88,7 @@ pub use magic_map_macros::__magic_map_expand;
 /// `Validation` is only present when the `validate` feature is enabled and the
 /// destination struct has `#[validate(...)]` field annotations.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(not(feature = "validate"), derive(Eq))]
 pub enum MappingError {
     InvalidUuid {
         field: &'static str,

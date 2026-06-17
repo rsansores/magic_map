@@ -497,6 +497,8 @@ mod validated {
 }
 
 magic_map!(validated::RawInput => validated::ValidatedDto);
+// fn form with a validated destination.
+magic_map!(pub fn raw_to_validated_dto: validated::RawInput => validated::ValidatedDto);
 
 #[test]
 fn validated_dest_passes_when_data_is_valid() {
@@ -529,6 +531,77 @@ fn validated_dest_errors_when_data_fails_constraints() {
     }
     .map_into();
     assert!(matches!(result2, Err(MappingError::Validation(_))));
+}
+
+mod validated_defaults {
+    use magic_map::MagicMap;
+    use validator::Validate;
+
+    #[derive(MagicMap)]
+    pub struct RawCreate {
+        pub name: String,
+        pub note: Option<String>,
+    }
+
+    #[derive(Debug, Validate, MagicMap)]
+    pub struct NewRecord {
+        #[validate(length(min = 1, max = 50))]
+        pub name: String,
+        pub note: Option<String>,
+        pub status: String, // absent from source, filled by Default
+    }
+
+    impl Default for NewRecord {
+        fn default() -> Self {
+            NewRecord {
+                name: String::new(),
+                note: None,
+                status: "new".into(),
+            }
+        }
+    }
+}
+
+magic_map!(validated_defaults::RawCreate => validated_defaults::NewRecord {
+    ..Default::default()
+});
+
+#[test]
+fn validated_dest_with_defaults_trailer() {
+    // Valid: status comes from Default, validation passes.
+    let row: validated_defaults::NewRecord = validated_defaults::RawCreate {
+        name: "Misifu".into(),
+        note: None,
+    }
+    .map_into()
+    .unwrap();
+    assert_eq!(row.name, "Misifu");
+    assert_eq!(row.status, "new");
+
+    // Invalid: empty name fails length(min = 1) even after defaults are applied.
+    let bad: Result<validated_defaults::NewRecord, _> = validated_defaults::RawCreate {
+        name: "".into(),
+        note: None,
+    }
+    .map_into();
+    assert!(matches!(bad, Err(MappingError::Validation(_))));
+}
+
+#[test]
+fn validated_dest_fn_form_validates() {
+    assert!(raw_to_validated_dto(validated::RawInput {
+        name: "Alice".into(),
+        email: "alice@example.com".into(),
+    })
+    .is_ok());
+
+    assert!(matches!(
+        raw_to_validated_dto(validated::RawInput {
+            name: "Alice".into(),
+            email: "bad".into(),
+        }),
+        Err(MappingError::Validation(_))
+    ));
 }
 
 #[test]
