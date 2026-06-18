@@ -1,0 +1,17 @@
+# Standalone crate (own `[workspace]` so the parent workspace does not absorb it
+# and unify features onto it). It depends on `magic_map` WITHOUT the `validate`
+# feature while still using the `validator` crate and `#[validate(...)]`
+# attributes on a magic_map destination. This guards the gating regression:
+# `#[validate(...)]` detection must stay off unless `magic_map/validate` is on,
+# otherwise these users would fail to compile.
+[workspace]
+
+[package]
+name = "no-validate-feature"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+magic_map = { path = "../../magic_map", default-features = false }
+validator = { version = "0.20", features = ["derive"] }

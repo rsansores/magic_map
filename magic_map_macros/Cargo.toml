@@ -11,6 +11,13 @@ readme = "../README.md"
 [lib]
 proc-macro = true
 
+[features]
+# Enabled transitively by `magic_map/validate`. Gates `#[validate(...)]`
+# detection so the generated `.validate()` call (and the
+# `MappingError::Validation` variant it references) is only emitted when the
+# user opted into validation.
+validate = []
+
 [dependencies]
 proc-macro2 = "1.0"
 quote = "1.0"

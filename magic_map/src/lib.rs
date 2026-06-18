@@ -81,12 +81,27 @@ pub use magic_map_macros::{magic_map, MagicMap};
 #[doc(hidden)]
 pub use magic_map_macros::__magic_map_expand;
 
+// Re-exported so generated code can reach the `Validate` trait as
+// `::magic_map::validator::Validate` without the call-site (or a neutral mapper
+// crate) needing a direct `validator` dependency, and so the `validator` version
+// that backs `MappingError::Validation` is the same one the generated
+// `.validate()` call resolves against.
+#[cfg(feature = "validate")]
+#[doc(hidden)]
+pub use validator;
+
 /// The single error surfaced by every mapping. Layer error types convert from
 /// it once (e.g. `ApiError: From<MappingError>`), so call sites just bubble
 /// with `?`.
 ///
 /// `Validation` is only present when the `validate` feature is enabled and the
 /// destination struct has `#[validate(...)]` field annotations.
+///
+/// Note: enabling `validate` drops the `Eq` impl, because
+/// `validator::ValidationErrors` is only `PartialEq`. Cargo features are
+/// additive, so this applies build-wide once *any* crate in the graph turns the
+/// feature on — `==`, `match`, and `assert_eq!` still work; an `Eq` bound does
+/// not.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(not(feature = "validate"), derive(Eq))]
 pub enum MappingError {

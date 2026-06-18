@@ -50,11 +50,17 @@ pub fn derive(input: DeriveInput) -> Result<TokenStream, syn::Error> {
                 // Use @vstruct (instead of @struct) when any field carries
                 // #[validate(...)], so __magic_map_expand! knows to call
                 // validator::Validate::validate(&result)? after construction.
-                let kind = if named
-                    .named
-                    .iter()
-                    .any(|f| f.attrs.iter().any(|a| a.path().is_ident("validate")))
-                {
+                // Gated on the `validate` feature (turned on transitively by
+                // `magic_map/validate`): without it the validation call and the
+                // `MappingError::Validation` variant it references don't exist,
+                // so emitting @vstruct would not compile for `validator` users
+                // who never opted in.
+                let validated = cfg!(feature = "validate")
+                    && named
+                        .named
+                        .iter()
+                        .any(|f| f.attrs.iter().any(|a| a.path().is_ident("validate")));
+                let kind = if validated {
                     quote! { vstruct }
                 } else {
                     quote! { struct }
@@ -647,7 +653,7 @@ pub fn expand(raw: TokenStream2, input: ExpandInput) -> Result<TokenStream, syn:
                 #prelude
                 #(#lets)*
                 let __magic_result = #dest { #(#assigns,)* #trailer };
-                ::validator::Validate::validate(&__magic_result)
+                ::magic_map::validator::Validate::validate(&__magic_result)
                     .map_err(::magic_map::MappingError::Validation)?;
                 ::core::result::Result::Ok(__magic_result)
             }

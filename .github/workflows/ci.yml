@@ -21,3 +21,6 @@ jobs:
       - run: cargo clippy --workspace --all-features --all-targets -- -D warnings
       - run: cargo test --workspace --all-features
       - run: cargo build -p magic_map --no-default-features
+      # Gating guard: `validator` users who don't enable `magic_map/validate`
+      # must still compile (no `.validate()` call is generated).
+      - run: cargo build --manifest-path compat/no-validate-feature/Cargo.toml

@@ -506,12 +506,20 @@ assert!(matches!(bad, Err(magic_map::MappingError::Validation(_))));
 Enable the feature in `Cargo.toml`:
 
 ```toml
-magic_map = { version = "0.1", features = ["validate"] }
+magic_map = { version = "0.2", features = ["validate"] }
 ```
 
 Validation runs after all field conversions succeed — a type error (e.g. a bad
 UUID parse) surfaces its own `MappingError` variant before `.validate()` is
 ever called.
+
+> **`Eq` caveat.** Enabling `validate` adds a
+> `MappingError::Validation(validator::ValidationErrors)` variant, and
+> `ValidationErrors` is only `PartialEq`, so `MappingError` no longer derives
+> `Eq` in that configuration. Cargo features are additive, so this takes effect
+> build-wide once *any* crate in the graph turns the feature on. `==`, `match`,
+> and `assert_eq!` are unaffected; only an explicit `Eq` bound (e.g. using
+> `MappingError` as a `HashMap` key) is.
 
 [validator]: https://crates.io/crates/validator
 

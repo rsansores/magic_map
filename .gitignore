@@ -1,1 +1,3 @@
 /target
+compat/*/target/
+compat/*/Cargo.lock

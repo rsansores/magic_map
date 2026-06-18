@@ -604,6 +604,53 @@ fn validated_dest_fn_form_validates() {
     ));
 }
 
+mod validated_tuple {
+    use magic_map::MagicMap;
+    use validator::Validate;
+
+    #[derive(MagicMap)]
+    pub struct Names {
+        pub name: String,
+    }
+
+    #[derive(MagicMap)]
+    pub struct Contact {
+        pub email: String,
+    }
+
+    #[derive(Debug, Validate, MagicMap)]
+    pub struct ValidatedPerson {
+        #[validate(length(min = 1, max = 50))]
+        pub name: String,
+        #[validate(email)]
+        pub email: String,
+    }
+}
+
+// Tuple source: `name` auto-matches element 0, `email` element 1, then the
+// fully-built value is validated.
+magic_map!(pub fn names_and_contact: (validated_tuple::Names, validated_tuple::Contact)
+    => validated_tuple::ValidatedPerson);
+
+#[test]
+fn validated_dest_tuple_source_validates() {
+    let ok = names_and_contact((
+        validated_tuple::Names { name: "Ada".into() },
+        validated_tuple::Contact {
+            email: "ada@example.com".into(),
+        },
+    ));
+    assert!(ok.is_ok());
+
+    let bad = names_and_contact((
+        validated_tuple::Names { name: "Ada".into() },
+        validated_tuple::Contact {
+            email: "not-an-email".into(),
+        },
+    ));
+    assert!(matches!(bad, Err(MappingError::Validation(_))));
+}
+
 #[test]
 fn leaf_conversions() {
     let u = Uuid::map_from("00000000-0000-0000-0000-000000000000".to_string()).unwrap();
