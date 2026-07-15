@@ -137,6 +137,39 @@ impl fmt::Display for MappingError {
 }
 impl Error for MappingError {}
 
+// `From` conversions for the leaf parse errors, so an override expression
+// inside a `magic_map!` body can `?` them directly:
+//
+//     magic_map!(pub fn f: Src => Dest {
+//         id: Uuid::parse_str(&src.raw)?,   // uuid::Error -> MappingError
+//     });
+//
+// The auto-path already converts these types (String -> Uuid, etc.); these
+// impls make the same leaves reachable from a manual override, instead of
+// hand-rolling `.map_err(|e| MappingError::Custom(e.to_string()))`. They mirror
+// the auto-path's behaviour: a structured variant, the source message dropped.
+// `field` is `"<override>"` because a `From` impl has no field-name context.
+#[cfg(feature = "uuid")]
+impl From<uuid::Error> for MappingError {
+    fn from(_: uuid::Error) -> Self {
+        MappingError::InvalidUuid { field: "<override>" }
+    }
+}
+
+#[cfg(feature = "chrono")]
+impl From<chrono::ParseError> for MappingError {
+    fn from(_: chrono::ParseError) -> Self {
+        MappingError::Parse { field: "<override>" }
+    }
+}
+
+#[cfg(feature = "decimal")]
+impl From<rust_decimal::Error> for MappingError {
+    fn from(_: rust_decimal::Error) -> Self {
+        MappingError::Parse { field: "<override>" }
+    }
+}
+
 /// Fallible field/struct/enum conversion. Implemented by `magic_map!` for
 /// structs and enums, and by the leaf impls below for known type pairs.
 ///

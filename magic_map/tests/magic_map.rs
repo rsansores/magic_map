@@ -666,3 +666,67 @@ fn leaf_conversions() {
         Err(MappingError::OutOfRange { field: "<decimal>" })
     );
 }
+
+// ── `?` on a leaf parse error inside an override ──────────────────────────────
+//
+// An override expression can propagate the leaf parse errors with `?` directly,
+// via `From<uuid::Error> / <chrono::ParseError> / <rust_decimal::Error> for
+// MappingError`. Without those impls this needed a hand-rolled
+// `.map_err(|e| MappingError::Custom(e.to_string()))`.
+mod override_question_mark {
+    use super::*;
+
+    mod src {
+        use magic_map::MagicMap;
+        #[derive(Clone, MagicMap)]
+        pub struct Row {
+            pub raw_id: String,
+            pub name: String,
+        }
+    }
+    mod dst {
+        use magic_map::MagicMap;
+        use uuid::Uuid;
+        #[derive(Debug, PartialEq, MagicMap)]
+        pub struct Model {
+            pub id: Uuid,
+            pub name: String,
+        }
+    }
+
+    // `id` is overridden and parses a String with `?`; `name` auto-maps.
+    magic_map!(pub fn row_to_model: src::Row => dst::Model {
+        id: Uuid::parse_str(&src.raw_id)?,
+    });
+
+    #[test]
+    fn override_can_question_mark_a_uuid_parse() {
+        let ok = row_to_model(src::Row {
+            raw_id: "0195aaaa-0000-7000-a000-000000000001".into(),
+            name: "n".into(),
+        })
+        .expect("valid uuid maps");
+        assert_eq!(ok.name, "n");
+
+        let err = row_to_model(src::Row {
+            raw_id: "not-a-uuid".into(),
+            name: "n".into(),
+        })
+        .unwrap_err();
+        assert_eq!(err, MappingError::InvalidUuid { field: "<override>" });
+    }
+
+    #[test]
+    fn from_impls_cover_chrono_and_decimal() {
+        let chrono_err = "nope".parse::<chrono::DateTime<chrono::Utc>>().unwrap_err();
+        assert_eq!(
+            MappingError::from(chrono_err),
+            MappingError::Parse { field: "<override>" }
+        );
+        let decimal_err = "nope".parse::<Decimal>().unwrap_err();
+        assert_eq!(
+            MappingError::from(decimal_err),
+            MappingError::Parse { field: "<override>" }
+        );
+    }
+}

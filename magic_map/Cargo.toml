@@ -11,7 +11,7 @@ authors.workspace = true
 readme = "../README.md"
 
 [dependencies]
-magic_map_macros = { version = "=0.2.0", path = "../magic_map_macros" }
+magic_map_macros = { version = "=0.2.1", path = "../magic_map_macros" }
 chrono = { version = "0.4", optional = true }
 rust_decimal = { version = "1", optional = true }
 serde_json = { version = "1", optional = true }
