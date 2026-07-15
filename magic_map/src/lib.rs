@@ -152,21 +152,27 @@ impl Error for MappingError {}
 #[cfg(feature = "uuid")]
 impl From<uuid::Error> for MappingError {
     fn from(_: uuid::Error) -> Self {
-        MappingError::InvalidUuid { field: "<override>" }
+        MappingError::InvalidUuid {
+            field: "<override>",
+        }
     }
 }
 
 #[cfg(feature = "chrono")]
 impl From<chrono::ParseError> for MappingError {
     fn from(_: chrono::ParseError) -> Self {
-        MappingError::Parse { field: "<override>" }
+        MappingError::Parse {
+            field: "<override>",
+        }
     }
 }
 
 #[cfg(feature = "decimal")]
 impl From<rust_decimal::Error> for MappingError {
     fn from(_: rust_decimal::Error) -> Self {
-        MappingError::Parse { field: "<override>" }
+        MappingError::Parse {
+            field: "<override>",
+        }
     }
 }
 

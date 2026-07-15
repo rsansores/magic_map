@@ -713,7 +713,12 @@ mod override_question_mark {
             name: "n".into(),
         })
         .unwrap_err();
-        assert_eq!(err, MappingError::InvalidUuid { field: "<override>" });
+        assert_eq!(
+            err,
+            MappingError::InvalidUuid {
+                field: "<override>"
+            }
+        );
     }
 
     #[test]
@@ -721,12 +726,16 @@ mod override_question_mark {
         let chrono_err = "nope".parse::<chrono::DateTime<chrono::Utc>>().unwrap_err();
         assert_eq!(
             MappingError::from(chrono_err),
-            MappingError::Parse { field: "<override>" }
+            MappingError::Parse {
+                field: "<override>"
+            }
         );
         let decimal_err = "nope".parse::<Decimal>().unwrap_err();
         assert_eq!(
             MappingError::from(decimal_err),
-            MappingError::Parse { field: "<override>" }
+            MappingError::Parse {
+                field: "<override>"
+            }
         );
     }
 }
