@@ -1,0 +1,13 @@
+# Not published — a dev-dependency of `magic_map` so the cross-crate half of
+# `magic_map_leaves!` / `leaves_from` is exercised for real. Declaring the block
+# and replaying it inside one crate would prove nothing: the whole point is that
+# a consumer resolves the paths, which only a crate boundary can test.
+[package]
+name = "leaf_provider"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+magic_map = { path = "../magic_map", features = ["full"] }
+strum = { version = "0.27", features = ["derive"] }

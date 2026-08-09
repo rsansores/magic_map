@@ -267,45 +267,62 @@ This is what lets mappers live in a crate that owns neither side — a services
 layer between a `*_db` crate and a `*_dtos` crate, with no dependency edge
 between the two.
 
-#### Leaves need no declaration
+#### Reaching your leaves
 
-Nothing to configure — not the built-in leaves, not your `map_identity!` /
-`map_display!` / `map_parse!` declarations, not a `MapFrom` impl you wrote by
-hand, not a generic wrapper like a `Patch<T>` update field. Declaring a mapping
-is the only way anything is ever registered.
+Built-in leaves — primitives, `String`, `Uuid`, `chrono`, `Decimal`,
+`serde_json::Value`, the integer widenings — are always present.
 
-That falls out of how the tiers are built. Field resolution probes two of them
-by autoref, and the fn form emits **concrete** tier-1 impls — one per declared
-pair. A leaf pair therefore has no tier-1 candidate at all, so probing derefs
-straight to the tier-2 blanket over `MapFrom` and finds it there.
-
-The obvious alternative does not work, which is worth knowing if you ever touch
-this code. A *blanket* tier 1 —
+Your own come from the crates that own them. A crate declares its leaves once,
+in its root, with `magic_map_leaves!`:
 
 ```rust
-impl<S, D: LocalMapFrom<S>> ProbeLocal<D> for &mut &mut MapProbe<S, D> { .. }
+// leaf-owning crate, e.g. your db crate
+magic_map::magic_map_leaves! {
+    identity: [crate::enums::Species],
+    display:  [crate::enums::Species],
+    parse:    [crate::enums::Species],
+    // A pair whose impl you wrote by hand. The impl stays where it is; only
+    // the pair is registered, because a macro cannot see an impl.
+    custom:   [crate::wire::Fahrenheit => String],
+}
 ```
 
-— matches every pair structurally, so the compiler commits to it and then
-reports the unsatisfied bound rather than falling through:
-
-```text
-error[E0277]: the trait bound `u16: LocalMapFrom<u8>` is not satisfied
-```
-
-Method probing selects a candidate by receiver shape and does **not** retry a
-lower tier when a where-bound fails. Concrete impls are what make the fallback
-real.
-
-#### Why the trait has to be local
-
-The shortcut — one blanket forwarding every existing `MapFrom` into the local
-trait — is not expressible either:
+and every consumer names the **crate**, never a type:
 
 ```rust
-// rejected by coherence
-impl<S, D: MapFrom<S>> LocalMapFrom<S> for D { .. }
+magic_map::magic_map_scope!(from: [my_db, my_commons]);
 ```
+
+Add an enum to that block and it reaches every consumer with no edit on their
+side. Write your own types as `crate::…` — those paths are republished as
+`$crate::` so a consumer resolves them against the declaring crate; anything
+else (`String`, `::chrono::DateTime<..>`) passes through verbatim.
+
+For a one-off pair whose crate has no block, `leaves:` takes it inline — a bare
+type is its identity, `Src => Dest` one direction. A wrapper whose own `MapFrom`
+impl is generic goes in `generic_leaves`, `;`-separated so the `where` clause's
+commas stay unambiguous:
+
+```rust
+magic_map::magic_map_scope! {
+    from: [my_db],
+    leaves: [Celsius, Celsius => String],
+    generic_leaves: {
+        <S, D> Patch<S> => Patch<D> where D: ::magic_map::MapFrom<S>;
+    },
+}
+```
+
+A pair that never arrives fails at the mapping that needed it, naming both
+types: ``the trait bound `String: LocalMapFrom<Celsius>` is not satisfied``.
+
+#### Why the trait is a closed world
+
+Two shortcuts look obvious and neither is available.
+
+A blanket bridge forwarding every existing `MapFrom` into the local trait
+overlaps the per-pair impls, and coherence cannot rule the overlap out because
+either upstream crate could add the conflicting impl later:
 
 ```text
 error[E0119]: conflicting implementations of trait `LocalMapFrom<Address>`
@@ -314,9 +331,18 @@ error[E0119]: conflicting implementations of trait `LocalMapFrom<Address>`
            `MapFrom<Address>` for type `AddressResponse` in future versions
 ```
 
-It overlaps the per-pair impls and the compiler cannot rule that out, because
-either upstream crate could add the impl later. Hence a local trait carrying
-only declared pairs, and the probe reaching `MapFrom` for everything else.
+Nor can a second, `MapFrom`-backed tier sit underneath to catch leaves.
+Autoref tiering needs the tiers told apart by receiver *shape*, as
+`MapFieldOpt`/`MapFieldVal`/`MapFieldWrap` are; a tier separated only by a
+where-bound hard-errors rather than falling through. And a concrete per-pair
+tier is worse than useless: with the destination type still open, probing
+matches on the source alone and unifies the destination to whatever that impl
+produces — so a type with both a declared mapping and a leaf (an enum with a DTO
+twin *and* a `map_display!` to `String`) silently resolves to the wrong one, and
+the expected type does not override it.
+
+Hence one funnel, leaves delegated in, and `magic_map_leaves!` so that no
+consumer ever transcribes them.
 
 ### `let` preludes
 
@@ -669,9 +695,9 @@ impl magic_map::MapFrom<MyWireTimestamp> for chrono::DateTime<chrono::Utc> {
 }
 ```
 
-These automap everywhere — impl form and fn form alike. A fn-form crate needs
-[`magic_map_scope!()`](#magic_map_scope--the-fn-forms-crate-local-funnel) in
-its root, but nothing about your leaves has to be repeated there.
+These automap everywhere the impl form is used. To reach them from a **fn-form**
+mapping too, declare them with [`magic_map_leaves!`](#reaching-your-leaves)
+instead — same impls, plus the published list a consumer's scope replays.
 
 [strum]: https://crates.io/crates/strum
 
@@ -708,14 +734,11 @@ decision for the handler that owns the batch, not for the conversion.
   crate-root export — rename one or use `#[magic_map(export = "...")]`.
 - Destination types must have named fields (or unit variants); tuple structs
   are not supported as destinations.
-- The fn form needs [`magic_map_scope!()`](#magic_map_scope--the-fn-forms-crate-local-funnel)
-  in the crate root — once, no arguments. Coherence allows no automatic bridge
-  from `MapFrom`, so the local trait cannot simply be derived; see that section
-  for the compiler's own reasoning.
-- A declared pair nested inside a *custom generic wrapper* (`Patch<Address>` →
-  `Patch<AddressResponse>`, as opposed to `Patch<String>` → `Patch<String>`)
-  has no tier-1 candidate; give that field an explicit override. Wrappers over
-  leaves, and `Option`/`Vec` over declared pairs, are handled.
+- The fn form needs [`magic_map_scope!`](#magic_map_scope--the-fn-forms-crate-local-funnel)
+  in the crate root, naming the crates whose leaves it uses. Coherence allows no
+  automatic bridge from `MapFrom` — see that section for the compiler's own
+  reasoning — so leaves are delegated in, and `magic_map_leaves!` keeps that from
+  becoming per-consumer bookkeeping.
 
 ## License
 

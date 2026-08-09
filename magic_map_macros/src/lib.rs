@@ -100,3 +100,31 @@ pub fn __magic_map_expand(input: TokenStream) -> TokenStream {
     magic_map::expand(raw, parse_macro_input!(input as magic_map::ExpandInput))
         .unwrap_or_else(|e| e.to_compile_error().into())
 }
+
+/// `magic_map_leaves!` — declare a crate's leaf conversions once, and publish
+/// the list so consumers never restate it.
+///
+/// Call it once, in your crate root. It emits the `MapFrom` impls (the same
+/// ones `map_identity!` / `map_display!` / `map_parse!` produce) and a hidden
+/// macro that `magic_map_scope!`'s `from:` replays — so adding a type here
+/// reaches every downstream crate with no edit on their side.
+///
+/// ```ignore
+/// magic_map::magic_map_leaves! {
+///     identity: [crate::enums::Species],
+///     display:  [crate::enums::Species],
+///     parse:    [crate::enums::Species],
+///     // A pair whose impl you wrote by hand. The impl stays where it is;
+///     // only the pair is registered, because a macro cannot see an impl.
+///     custom:   [crate::wire::Fahrenheit => String],
+/// }
+/// ```
+///
+/// Write your own types as `crate::…`. Those paths are rewritten to `$crate::`
+/// in the published list, so a consumer resolves them against *this* crate.
+/// Anything else (`String`, `::chrono::DateTime<..>`) passes through verbatim.
+#[proc_macro]
+pub fn magic_map_leaves(input: TokenStream) -> TokenStream {
+    magic_map::leaves(parse_macro_input!(input as magic_map::LeavesInput))
+        .unwrap_or_else(|e| e.to_compile_error().into())
+}

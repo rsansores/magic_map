@@ -82,7 +82,7 @@
 use std::error::Error;
 use std::fmt;
 
-pub use magic_map_macros::{magic_map, MagicMap};
+pub use magic_map_macros::{magic_map, magic_map_leaves, MagicMap};
 
 #[doc(hidden)]
 pub use magic_map_macros::__magic_map_expand;
@@ -447,53 +447,105 @@ macro_rules! map_parse {
 // had nothing to resolve against: `Vec<Address>` → `Vec<AddressResponse>` needs
 // `AddressResponse: MapFrom<Address>`, and that impl cannot exist anywhere.
 //
-// `magic_map_scope!()` plants a trait in the *calling* crate. The orphan rule
-// is satisfied by a local trait just as well as by a local type, so
+// `magic_map_scope!` plants a trait in the *calling* crate. The orphan rule is
+// satisfied by a local trait just as well as by a local type, so
 // `impl LocalMapFrom<Address> for AddressResponse` is legal there even though
-// both types are foreign — and the fn form emits one for every mapping it
-// declares.
+// both types are foreign, and the fn form emits one per mapping it declares.
 //
-// Leaves need no declaration. Field resolution probes two tiers by autoref:
-// the fn form emits CONCRETE tier-1 impls, one per declared pair, so a leaf
-// pair has no tier-1 candidate at all and probing derefs to the tier-2 blanket
-// over `MapFrom`. That is the whole trick — a *blanket* tier 1 would match
-// every pair structurally and then hard-error on its unsatisfied bound instead
-// of falling through, which is why the tiers cannot be written the obvious way.
-// One consequence worth stating: there is exactly one way to register a
-// conversion, which is to declare it. Nothing else needs configuring, ever.
+// The trait is a CLOSED WORLD: everything the fn form funnels through has a
+// `LocalMapFrom` impl, leaves included. Two dead ends forced that, both worth
+// knowing before anyone tries to "simplify" this:
+//
+//   * A blanket bridge `impl<S, D: MapFrom<S>> LocalMapFrom<S> for D` overlaps
+//     the per-pair impls and coherence rejects it — "upstream crates may add a
+//     new impl of `MapFrom<Address>` for `AddressResponse` in future versions".
+//
+//   * Nor can a second, `MapFrom`-backed tier sit underneath to catch leaves.
+//     Autoref tiering needs the tiers told apart by receiver SHAPE (as
+//     `MapFieldOpt`/`MapFieldVal`/`MapFieldWrap` are); a tier separated only by
+//     a where-bound hard-errors rather than falling through. A concrete
+//     per-pair tier is worse: with the destination still open, probing matches
+//     on the source alone and unifies the destination to whatever that impl
+//     produces, so a source carrying both a declared mapping and a leaf — an
+//     enum with a DTO twin *and* a `map_display!` to `String` — resolves to the
+//     wrong one, and the expected type does not override it.
+//
+// So leaves are delegated in, and `magic_map_leaves!` keeps that from becoming
+// per-consumer bookkeeping: a crate declares its leaves once and
+// `leaves_from: [that_crate]` replays the list.
 
 /// Declares the crate-local mapping funnel that the fn form of `magic_map!`
 /// resolves nested fields through. Call it **once, in the crate root**
-/// (`lib.rs` / `main.rs`) of any crate that declares a fn-form mapping:
+/// (`lib.rs` / `main.rs`) of any crate that declares a fn-form mapping.
 ///
 /// ```ignore
 /// // src/lib.rs
-/// magic_map::magic_map_scope!();
+/// magic_map::magic_map_scope! {
+///     leaves_from: [quickedge_commons, quickedge_db],
+/// }
 /// ```
-///
-/// It takes no configuration. Leaves — the built-in ones, your
-/// [`map_identity!`] / [`map_display!`] / [`map_parse!`] declarations, and any
-/// `MapFrom` impl you wrote by hand — are found without being named.
 ///
 /// Needed only for the fn form. A crate whose mappings are all impl form
 /// (`magic_map!(Src => Dest)`, where one side is local) never calls it — those
-/// funnel through `MapFrom` as they always have.
+/// funnel through `MapFrom` as they always have. Missing it reads as
+/// ``could not find `__magic_map_scope` in the crate root``.
 ///
-/// Missing it reads as ``could not find `__magic_map_scope` in the crate root``
-/// at the first fn-form mapping.
+/// # Reaching your leaves
+///
+/// Built-in leaves (primitives, `String`, `Uuid`, `chrono`, `Decimal`,
+/// `serde_json::Value`, the integer widenings) are always present. Your own
+/// arrive through `leaves_from`, which replays the [`magic_map_leaves!`] block
+/// of every crate named — so adding an enum there needs no edit in any
+/// consumer.
+///
+/// `leaves: [..]` is the escape hatch for a one-off pair whose crate has no
+/// block: a bare type is its identity, `Src => Dest` delegates that direction.
+/// A generic wrapper goes in `generic_leaves`, `;`-separated so the `where`
+/// clause's commas stay unambiguous:
+///
+/// ```ignore
+/// magic_map::magic_map_scope! {
+///     leaves_from: [quickedge_db],
+///     leaves: [Celsius, Celsius => String],
+///     generic_leaves: {
+///         <S, D> Patch<S> => Patch<D> where D: ::magic_map::MapFrom<S>;
+///     },
+/// }
+/// ```
+///
+/// A pair that never arrives fails at the mapping that needed it, naming both
+/// types: ``the trait bound `String: LocalMapFrom<Celsius>` is not satisfied``.
 #[macro_export]
 macro_rules! magic_map_scope {
-    () => {
+    () => { $crate::magic_map_scope!(from: [], leaves: [], generic_leaves: {}); };
+    (from: [ $($from:ident),* $(,)? ] $(,)?) => {
+        $crate::magic_map_scope!(from: [ $($from),* ], leaves: [], generic_leaves: {});
+    };
+    (leaves: [ $($leaf:tt)* ] $(,)?) => {
+        $crate::magic_map_scope!(from: [], leaves: [ $($leaf)* ], generic_leaves: {});
+    };
+    (from: [ $($from:ident),* $(,)? ], leaves: [ $($leaf:tt)* ] $(,)?) => {
+        $crate::magic_map_scope!(from: [ $($from),* ], leaves: [ $($leaf)* ], generic_leaves: {});
+    };
+    (from: [ $($from:ident),* $(,)? ], generic_leaves: { $($g:tt)* } $(,)?) => {
+        $crate::magic_map_scope!(from: [ $($from),* ], leaves: [], generic_leaves: { $($g)* });
+    };
+    (
+        from: [ $($from:ident),* $(,)? ],
+        leaves: [ $($leaf:tt)* ],
+        generic_leaves: { $($generic:tt)* } $(,)?
+    ) => {
         #[doc(hidden)]
         pub mod __magic_map_scope {
             //! Generated by `magic_map::magic_map_scope!`. The fn form of
-            //! `magic_map!` resolves its fields through the traits here.
+            //! `magic_map!` resolves its fields through `LocalMapFrom` here.
 
             #[allow(unused_imports)]
             use super::*;
 
-            /// Crate-local twin of [`magic_map::MapFrom`], implemented by the
-            /// fn form for pairs the orphan rule keeps off `MapFrom`.
+            /// Crate-local twin of [`magic_map::MapFrom`]. The fn form
+            /// implements it for pairs the orphan rule keeps off `MapFrom`;
+            /// leaves are delegated in below.
             pub trait LocalMapFrom<S>: Sized {
                 fn local_map_from(src: S) -> ::core::result::Result<Self, $crate::MappingError>;
             }
@@ -505,9 +557,11 @@ macro_rules! magic_map_scope {
                     src: ::core::option::Option<S>,
                 ) -> ::core::result::Result<Self, $crate::MappingError> {
                     match src {
-                        ::core::option::Option::Some(s) => ::core::result::Result::Ok(
-                            ::core::option::Option::Some(D::local_map_from(s)?),
-                        ),
+                        ::core::option::Option::Some(s) => {
+                            ::core::result::Result::Ok(::core::option::Option::Some(
+                                D::local_map_from(s)?,
+                            ))
+                        }
                         ::core::option::Option::None => {
                             ::core::result::Result::Ok(::core::option::Option::None)
                         }
@@ -523,54 +577,23 @@ macro_rules! magic_map_scope {
                 }
             }
 
-            // ── Plain field resolution: two tiers ───────────────────────────
-            //
-            // Tier 1 is populated only by the concrete impls the fn form emits
-            // per declared pair (see `__magic_map_declare_local!`). A leaf has
-            // no candidate here, so probing derefs to tier 2.
+            $crate::__magic_map_scope_leaves!();
+            $($from::__magic_map_leaves!();)*
+            $crate::__magic_map_scope_extra_leaves!( $($leaf)* );
+            $crate::__magic_map_scope_generic_leaves!( $($generic)* );
 
-            pub trait ProbeLocal<D> {
-                fn magic_probe(self) -> ::core::result::Result<D, $crate::MappingError>;
-            }
-
-            /// Tier 2 — every conversion that already has a `MapFrom` impl:
-            /// built-in leaves, your own leaf declarations, hand-written impls,
-            /// and the `Option`/`Vec` blankets over them.
-            pub trait ProbeGlobal<D> {
-                fn magic_probe(self) -> ::core::result::Result<D, $crate::MappingError>;
-            }
-            impl<S, D: $crate::MapFrom<S>> ProbeGlobal<D> for &mut $crate::MapProbe<S, D> {
-                fn magic_probe(self) -> ::core::result::Result<D, $crate::MappingError> {
-                    D::map_from(self.0.take().expect("magic_map field consumed twice"))
-                }
-            }
-
-            // ── `..Default::default()` field resolution: six tiers ──────────
-            //
-            // The three shapes of the `MapFrom` version, doubled: local first,
-            // then global. All six share a method name and are told apart by
-            // autoref depth, so the local ones win where they have a candidate
-            // and leaves fall straight through to the global three.
-
+            // `..Default::default()` field machinery over the local trait.
+            // Three autoref tiers told apart by receiver shape, mirroring
+            // `magic_map::MapPair`'s.
             pub trait LocalFieldOpt<D> {
-                fn magic_field(self) -> ::core::result::Result<D, $crate::MappingError>;
+                fn local_map_field_or(self) -> ::core::result::Result<D, $crate::MappingError>;
             }
-            pub trait LocalFieldVal<D> {
-                fn magic_field(self) -> ::core::result::Result<D, $crate::MappingError>;
-            }
-            pub trait LocalFieldWrap<D> {
-                fn magic_field(self) -> ::core::result::Result<D, $crate::MappingError>;
-            }
-
-            pub trait GlobalFieldOpt<D> {
-                fn magic_field(self) -> ::core::result::Result<D, $crate::MappingError>;
-            }
-            impl<S, D: $crate::MapFrom<S>> GlobalFieldOpt<D>
+            impl<S, D: LocalMapFrom<S>> LocalFieldOpt<D>
                 for &mut &mut &mut $crate::MapPair<::core::option::Option<S>, D>
             {
-                fn magic_field(self) -> ::core::result::Result<D, $crate::MappingError> {
+                fn local_map_field_or(self) -> ::core::result::Result<D, $crate::MappingError> {
                     match self.0.take().expect("magic_map field consumed twice") {
-                        ::core::option::Option::Some(s) => D::map_from(s),
+                        ::core::option::Option::Some(s) => D::local_map_from(s),
                         ::core::option::Option::None => ::core::result::Result::Ok(
                             self.1.take().expect("magic_map fallback consumed twice"),
                         ),
@@ -578,129 +601,253 @@ macro_rules! magic_map_scope {
                 }
             }
 
-            pub trait GlobalFieldVal<D> {
-                fn magic_field(self) -> ::core::result::Result<D, $crate::MappingError>;
+            pub trait LocalFieldVal<D> {
+                fn local_map_field_or(self) -> ::core::result::Result<D, $crate::MappingError>;
             }
-            impl<S, D: $crate::MapFrom<S>> GlobalFieldVal<D> for &mut &mut $crate::MapPair<S, D> {
-                fn magic_field(self) -> ::core::result::Result<D, $crate::MappingError> {
-                    D::map_from(self.0.take().expect("magic_map field consumed twice"))
+            impl<S, D: LocalMapFrom<S>> LocalFieldVal<D> for &mut &mut $crate::MapPair<S, D> {
+                fn local_map_field_or(self) -> ::core::result::Result<D, $crate::MappingError> {
+                    D::local_map_from(self.0.take().expect("magic_map field consumed twice"))
                 }
             }
 
-            pub trait GlobalFieldWrap<D> {
-                fn magic_field(self) -> ::core::result::Result<D, $crate::MappingError>;
+            pub trait LocalFieldWrap<D> {
+                fn local_map_field_or(self) -> ::core::result::Result<D, $crate::MappingError>;
             }
-            impl<S, U: $crate::MapFrom<S>> GlobalFieldWrap<::core::option::Option<U>>
+            impl<S, U: LocalMapFrom<S>> LocalFieldWrap<::core::option::Option<U>>
                 for &mut $crate::MapPair<S, ::core::option::Option<U>>
             {
-                fn magic_field(
+                fn local_map_field_or(
                     self,
                 ) -> ::core::result::Result<::core::option::Option<U>, $crate::MappingError>
                 {
                     let src = self.0.take().expect("magic_map field consumed twice");
-                    ::core::result::Result::Ok(::core::option::Option::Some(U::map_from(src)?))
+                    ::core::result::Result::Ok(::core::option::Option::Some(U::local_map_from(
+                        src,
+                    )?))
                 }
             }
         }
     };
 }
 
-/// Registers one declared pair in the crate-local funnel. Emitted by the fn
-/// form of `magic_map!` — the concrete tier-1 impls that let a leaf fall
-/// through to `MapFrom` while a declared pair does not.
+/// Delegates one `MapFrom` pair into the local trait. Used by
+/// `magic_map_scope!` for both the built-in leaves and the `leaves: [...]`
+/// list; the body is a plain call, so a missing `MapFrom` impl fails here and
+/// names the pair.
 #[doc(hidden)]
 #[macro_export]
-macro_rules! __magic_map_declare_local {
-    // `$scope` is the caller's `crate::__magic_map_scope`, passed in by the
-    // proc macro rather than spelled `crate::` here — inside a macro_rules
-    // definition that would read as this crate, which is not what is meant.
-    ($scope:path, $fn_name:ident, $src:ty, $dest:ty) => {
-        const _: () = {
-            use $scope::*;
-
-            impl LocalMapFrom<$src> for $dest {
-                fn local_map_from(src: $src) -> ::core::result::Result<Self, $crate::MappingError> {
-                    $fn_name(src)
-                }
+macro_rules! __magic_map_scope_delegate {
+    ($src:ty => $dest:ty) => {
+        impl LocalMapFrom<$src> for $dest {
+            fn local_map_from(src: $src) -> ::core::result::Result<Self, $crate::MappingError> {
+                <$dest as $crate::MapFrom<$src>>::map_from(src)
             }
-
-            // Plain resolution, and the two wrappers a DTO field actually uses.
-            impl ProbeLocal<$dest> for &mut &mut $crate::MapProbe<$src, $dest> {
-                fn magic_probe(self) -> ::core::result::Result<$dest, $crate::MappingError> {
-                    $fn_name(self.0.take().expect("magic_map field consumed twice"))
-                }
-            }
-            impl ProbeLocal<::std::vec::Vec<$dest>>
-                for &mut &mut $crate::MapProbe<::std::vec::Vec<$src>, ::std::vec::Vec<$dest>>
-            {
-                fn magic_probe(
-                    self,
-                ) -> ::core::result::Result<::std::vec::Vec<$dest>, $crate::MappingError> {
-                    <::std::vec::Vec<$dest> as LocalMapFrom<::std::vec::Vec<$src>>>::local_map_from(
-                        self.0.take().expect("magic_map field consumed twice"),
-                    )
-                }
-            }
-            impl ProbeLocal<::core::option::Option<$dest>>
-                for &mut &mut $crate::MapProbe<
-                    ::core::option::Option<$src>,
-                    ::core::option::Option<$dest>,
-                >
-            {
-                fn magic_probe(
-                    self,
-                ) -> ::core::result::Result<::core::option::Option<$dest>, $crate::MappingError>
-                {
-                    <::core::option::Option<$dest> as LocalMapFrom<
-                                        ::core::option::Option<$src>,
-                                    >>::local_map_from(
-                                        self.0.take().expect("magic_map field consumed twice")
-                                    )
-                }
-            }
-
-            // `..Default::default()` shapes.
-            impl LocalFieldOpt<$dest>
-                for &mut &mut &mut &mut &mut &mut $crate::MapPair<
-                    ::core::option::Option<$src>,
-                    $dest,
-                >
-            {
-                fn magic_field(self) -> ::core::result::Result<$dest, $crate::MappingError> {
-                    match self.0.take().expect("magic_map field consumed twice") {
-                        ::core::option::Option::Some(s) => $fn_name(s),
-                        ::core::option::Option::None => ::core::result::Result::Ok(
-                            self.1.take().expect("magic_map fallback consumed twice"),
-                        ),
-                    }
-                }
-            }
-            impl LocalFieldVal<$dest> for &mut &mut &mut &mut &mut $crate::MapPair<$src, $dest> {
-                fn magic_field(self) -> ::core::result::Result<$dest, $crate::MappingError> {
-                    $fn_name(self.0.take().expect("magic_map field consumed twice"))
-                }
-            }
-            impl LocalFieldWrap<::core::option::Option<$dest>>
-                for &mut &mut &mut &mut $crate::MapPair<$src, ::core::option::Option<$dest>>
-            {
-                fn magic_field(
-                    self,
-                ) -> ::core::result::Result<::core::option::Option<$dest>, $crate::MappingError>
-                {
-                    let src = self.0.take().expect("magic_map field consumed twice");
-                    ::core::result::Result::Ok(::core::option::Option::Some($fn_name(src)?))
-                }
-            }
-        };
+        }
     };
 }
 
+/// The `leaves: [...]` entries. A bare type is its identity.
 #[doc(hidden)]
-pub struct MapProbe<S, D>(pub Option<S>, pub core::marker::PhantomData<D>);
+#[macro_export]
+macro_rules! __magic_map_scope_extra_leaves {
+    () => {};
+    ($src:ty => $dest:ty, $($rest:tt)*) => {
+        $crate::__magic_map_scope_delegate!($src => $dest);
+        $crate::__magic_map_scope_extra_leaves!($($rest)*);
+    };
+    ($src:ty => $dest:ty $(,)?) => {
+        $crate::__magic_map_scope_delegate!($src => $dest);
+    };
+    ($t:ty, $($rest:tt)*) => {
+        $crate::__magic_map_scope_delegate!($t => $t);
+        $crate::__magic_map_scope_extra_leaves!($($rest)*);
+    };
+    ($t:ty $(,)?) => {
+        $crate::__magic_map_scope_delegate!($t => $t);
+    };
+}
 
-impl<S, D> MapProbe<S, D> {
-    #[doc(hidden)]
-    pub fn new(src: S) -> Self {
-        MapProbe(Some(src), core::marker::PhantomData)
-    }
+/// `generic_leaves { .. }` entries — one delegating impl per `;`-separated
+/// declaration, generics and bounds passed through verbatim.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __magic_map_scope_generic_leaves {
+    () => {};
+    (
+        < $($gen:tt),* $(,)? > $src:ty => $dest:ty where $($bound:tt)*
+    ) => {
+        $crate::__magic_map_scope_generic_one!( < $($gen),* > $src => $dest where $($bound)* );
+    };
+    (
+        < $($gen:tt),* $(,)? > $src:ty => $dest:ty ; $($rest:tt)*
+    ) => {
+        impl< $($gen),* > LocalMapFrom<$src> for $dest {
+            fn local_map_from(src: $src) -> ::core::result::Result<Self, $crate::MappingError> {
+                <$dest as $crate::MapFrom<$src>>::map_from(src)
+            }
+        }
+        $crate::__magic_map_scope_generic_leaves!( $($rest)* );
+    };
+}
+
+/// Terminal arm: splits a `where` clause off at its trailing `;`.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __magic_map_scope_generic_one {
+    (
+        < $($gen:tt),* > $src:ty => $dest:ty where $($bound:tt)*
+    ) => {
+        $crate::__magic_map_scope_generic_split!(
+            [ $($gen),* ] [ $src ] [ $dest ] [] $($bound)*
+        );
+    };
+}
+
+/// Walks the `where` clause token by token until the `;` that ends this
+/// declaration, then emits the impl and recurses on what follows.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __magic_map_scope_generic_split {
+    ( [ $($gen:tt),* ] [ $src:ty ] [ $dest:ty ] [ $($bound:tt)* ] ; $($rest:tt)* ) => {
+        impl< $($gen),* > LocalMapFrom<$src> for $dest where $($bound)* {
+            fn local_map_from(src: $src) -> ::core::result::Result<Self, $crate::MappingError> {
+                <$dest as $crate::MapFrom<$src>>::map_from(src)
+            }
+        }
+        $crate::__magic_map_scope_generic_leaves!( $($rest)* );
+    };
+    ( [ $($gen:tt),* ] [ $src:ty ] [ $dest:ty ] [ $($bound:tt)* ] $next:tt $($rest:tt)* ) => {
+        $crate::__magic_map_scope_generic_split!(
+            [ $($gen),* ] [ $src ] [ $dest ] [ $($bound)* $next ] $($rest)*
+        );
+    };
+}
+
+/// The built-in leaf set, delegated into a scope's local trait. Mirrors the
+/// `leaf_identity!` / `leaf_widen!` / `*_leaves` impls above one for one —
+/// `scope_covers_every_builtin_leaf` in the test suite fails if the two drift.
+///
+/// The feature-gated groups are separate macros rather than `#[cfg]` arms in
+/// the expansion: an emitted `#[cfg(feature = "uuid")]` is evaluated against
+/// the *calling* crate's features, which has no `uuid` feature and would drop
+/// every Uuid leaf on the floor. Defining each group's macro under the cfg
+/// here evaluates it against this crate's features, where it means something.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __magic_map_scope_leaves {
+    () => {
+        $crate::__magic_map_scope_extra_leaves!(
+            bool, char, i8, i16, i32, i64, i128, isize,
+            u8, u16, u32, u64, u128, usize, f32, f64,
+            ::std::string::String,
+        );
+        // Lossless widenings.
+        $crate::__magic_map_scope_extra_leaves!(
+            u8 => u16, u8 => u32, u8 => u64, u8 => i16, u8 => i32, u8 => i64,
+            u16 => u32, u16 => u64, u16 => i32, u16 => i64,
+            u32 => u64, u32 => i64,
+            i8 => i16, i8 => i32, i8 => i64,
+            i16 => i32, i16 => i64,
+            i32 => i64,
+            f32 => f64,
+        );
+        $crate::__magic_map_scope_uuid_leaves!();
+        $crate::__magic_map_scope_decimal_leaves!();
+        $crate::__magic_map_scope_chrono_leaves!();
+        $crate::__magic_map_scope_json_leaves!();
+    };
+}
+
+#[cfg(feature = "uuid")]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __magic_map_scope_uuid_leaves {
+    () => {
+        $crate::__magic_map_scope_extra_leaves!(
+            ::uuid::Uuid,
+            ::std::string::String => ::uuid::Uuid,
+            ::uuid::Uuid => ::std::string::String,
+        );
+    };
+}
+#[cfg(not(feature = "uuid"))]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __magic_map_scope_uuid_leaves {
+    () => {};
+}
+
+#[cfg(feature = "decimal")]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __magic_map_scope_decimal_leaves {
+    () => {
+        $crate::__magic_map_scope_extra_leaves!(
+            ::rust_decimal::Decimal,
+            ::rust_decimal::Decimal => f64,
+            f64 => ::rust_decimal::Decimal,
+            ::std::string::String => ::rust_decimal::Decimal,
+            ::rust_decimal::Decimal => ::std::string::String,
+        );
+    };
+}
+#[cfg(not(feature = "decimal"))]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __magic_map_scope_decimal_leaves {
+    () => {};
+}
+
+#[cfg(feature = "chrono")]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __magic_map_scope_chrono_leaves {
+    () => {
+        $crate::__magic_map_scope_extra_leaves!(
+            ::chrono::DateTime<::chrono::Utc>,
+            ::chrono::NaiveDate,
+            ::chrono::NaiveDateTime,
+            ::chrono::NaiveTime,
+            ::std::string::String => ::chrono::DateTime<::chrono::Utc>,
+            ::chrono::DateTime<::chrono::Utc> => ::std::string::String,
+            ::std::string::String => ::chrono::NaiveDate,
+            ::chrono::NaiveDate => ::std::string::String,
+        );
+    };
+}
+#[cfg(not(feature = "chrono"))]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __magic_map_scope_chrono_leaves {
+    () => {};
+}
+
+#[cfg(feature = "json")]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __magic_map_scope_json_leaves {
+    () => {
+        $crate::__magic_map_scope_extra_leaves!(::serde_json::Value);
+    };
+}
+#[cfg(not(feature = "json"))]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __magic_map_scope_json_leaves {
+    () => {};
+}
+
+/// One `LocalMapFrom` impl delegating to an existing `MapFrom` pair. Emitted by
+/// a crate's replayed leaf list and by `magic_map_scope!`'s own `leaves`; the
+/// bare `LocalMapFrom` binds to whichever scope module it lands in.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __magic_map_leaf_impl {
+    ($src:ty => $dest:ty) => {
+        impl LocalMapFrom<$src> for $dest {
+            fn local_map_from(src: $src) -> ::core::result::Result<Self, $crate::MappingError> {
+                <$dest as $crate::MapFrom<$src>>::map_from(src)
+            }
+        }
+    };
 }

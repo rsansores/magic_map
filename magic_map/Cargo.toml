@@ -28,6 +28,7 @@ validate = ["dep:validator", "magic_map_macros/validate"]
 full = ["chrono", "decimal", "json", "uuid", "validate"]
 
 [dev-dependencies]
+leaf_provider = { path = "../leaf_provider" }
 # Integration tests exercise every leaf; enabling `full` on ourselves keeps
 # `cargo test` meaningful without --all-features.
 magic_map = { path = ".", features = ["full"] }
