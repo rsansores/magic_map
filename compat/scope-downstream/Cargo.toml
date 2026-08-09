@@ -1,0 +1,24 @@
+# Standalone crate (own `[workspace]` so the parent does not absorb it) that
+# uses `magic_map_scope!` as a real downstream user would: it enables
+# magic_map's `full` feature but declares no features of its own.
+#
+# This guards a cfg-leakage regression. The scope's built-in leaves must be
+# emitted from macros defined under `#[cfg(feature = ...)]` *inside* magic_map.
+# An emitted `#[cfg(feature = "uuid")]` would instead be evaluated against THIS
+# crate's feature set — which is empty — silently dropping every Uuid, chrono,
+# Decimal and json leaf, and only failing much later in a user's nested field.
+# magic_map's own test crate cannot catch that: its features are magic_map's.
+[workspace]
+
+[package]
+name = "scope-downstream"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+magic_map = { path = "../../magic_map", features = ["full"] }
+uuid = { version = "1", features = ["v4"] }
+chrono = "0.4"
+rust_decimal = "1"
+serde_json = "1"

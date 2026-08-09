@@ -24,3 +24,4 @@ jobs:
       # Gating guard: `validator` users who don't enable `magic_map/validate`
       # must still compile (no `.validate()` call is generated).
       - run: cargo build --manifest-path compat/no-validate-feature/Cargo.toml
+      - run: cargo build --manifest-path compat/scope-downstream/Cargo.toml

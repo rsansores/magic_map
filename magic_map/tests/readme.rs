@@ -7,6 +7,10 @@
 // Example types exist to be mapped, not exhaustively read back.
 #![allow(dead_code)]
 
+// The fn-form examples below need the crate-local funnel; see the README's
+// `magic_map_scope!` section. Once, at the crate root, no arguments.
+magic_map::magic_map_scope!();
+
 use magic_map::{MapInto, MappingError};
 
 // ── Quick start ──────────────────────────────────────────────────────────────
@@ -487,4 +491,79 @@ fn custom_leaves() -> Result<(), MappingError> {
     let ts: chrono::DateTime<chrono::Utc> = MyWireTimestamp { seconds: 0 }.map_into()?;
     assert_eq!(ts.to_rfc3339(), "1970-01-01T00:00:00+00:00");
     Ok(())
+}
+
+// ── magic_map_scope! — the fn form's crate-local funnel ──────────────────────
+// The scope itself is declared once at the top of this file.
+
+mod scope_section {
+    use magic_map::magic_map;
+
+    pub mod db {
+        #[derive(magic_map::MagicMap, Clone)]
+        #[magic_map(export = "ScopeState")]
+        pub struct State {
+            pub name: String,
+        }
+        #[derive(magic_map::MagicMap, Clone)]
+        #[magic_map(export = "ScopeLocality")]
+        pub struct Locality {
+            pub name: String,
+        }
+        #[derive(magic_map::MagicMap, Clone)]
+        #[magic_map(export = "ScopePostalCode")]
+        pub struct PostalCode {
+            pub code: String,
+            pub state: State,
+            pub locality: Option<Locality>,
+            pub neighborhoods: Vec<Locality>,
+        }
+    }
+
+    pub mod dtos {
+        #[derive(magic_map::MagicMap, Debug)]
+        #[magic_map(export = "ScopeStateResponse")]
+        pub struct StateResponse {
+            pub name: String,
+        }
+        #[derive(magic_map::MagicMap, Debug)]
+        #[magic_map(export = "ScopeLocalityResponse")]
+        pub struct LocalityResponse {
+            pub name: String,
+        }
+        #[derive(magic_map::MagicMap, Debug)]
+        #[magic_map(export = "ScopePostalCodeResponse")]
+        pub struct PostalCodeResponse {
+            pub code: String,
+            pub state: StateResponse,
+            pub locality: Option<LocalityResponse>,
+            pub neighborhoods: Vec<LocalityResponse>,
+        }
+    }
+
+    magic_map!(pub fn state_to_dto:    db::State    => dtos::StateResponse);
+    magic_map!(pub fn locality_to_dto: db::Locality => dtos::LocalityResponse);
+
+    // nested State, Option<Locality>, Vec<Locality> — no overrides needed
+    magic_map!(pub fn postal_code_to_dto: db::PostalCode => dtos::PostalCodeResponse);
+}
+
+#[test]
+fn scope_section_nested_pairs_compose() {
+    let dto = scope_section::postal_code_to_dto(scope_section::db::PostalCode {
+        code: "97000".into(),
+        state: scope_section::db::State {
+            name: "Yucatán".into(),
+        },
+        locality: Some(scope_section::db::Locality {
+            name: "Mérida".into(),
+        }),
+        neighborhoods: vec![scope_section::db::Locality {
+            name: "Centro".into(),
+        }],
+    })
+    .unwrap();
+    assert_eq!(dto.state.name, "Yucatán");
+    assert_eq!(dto.locality.unwrap().name, "Mérida");
+    assert_eq!(dto.neighborhoods.len(), 1);
 }

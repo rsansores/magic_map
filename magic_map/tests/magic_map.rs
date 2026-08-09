@@ -3,6 +3,9 @@
 //! don't carry their own unit tests: asserting a generated field-by-field copy
 //! is restating the declaration.
 
+// Integration tests are their own crate, so the scope lives here rather than
+// in a lib.rs — same rule: once, at the crate root.
+magic_map::magic_map_scope!();
 use magic_map::magic_map;
 use magic_map::{MapFrom, MapInto, MappingError};
 use rust_decimal::Decimal;
@@ -738,4 +741,264 @@ mod override_question_mark {
             }
         );
     }
+}
+
+// ── foreign→foreign nested funnelling (magic_map_scope!) ─────────────────────
+//
+// The case the fn form could not express before: a mapper crate that owns
+// neither side. `db` and `dtos` stand in for `quickedge_db` / `quickedge_dtos`
+// — nothing in either knows the other exists, and no `MapFrom` impl between
+// them is legal anywhere.
+
+mod scoped {
+    pub mod db {
+        #[derive(magic_map::MagicMap, Clone)]
+        pub struct State {
+            pub name: String,
+        }
+        #[derive(magic_map::MagicMap, Clone)]
+        pub struct Locality {
+            pub name: String,
+        }
+        #[derive(magic_map::MagicMap, Clone)]
+        pub struct PostalCode {
+            pub code: String,
+            pub state: State,
+            pub locality: Option<Locality>,
+            pub neighborhoods: Vec<Locality>,
+            pub population: i32,
+        }
+    }
+
+    pub mod dtos {
+        #[derive(magic_map::MagicMap, Debug, PartialEq)]
+        pub struct StateResponse {
+            pub name: String,
+        }
+        #[derive(magic_map::MagicMap, Debug, PartialEq)]
+        pub struct LocalityResponse {
+            pub name: String,
+        }
+        #[derive(magic_map::MagicMap, Debug, PartialEq)]
+        pub struct PostalCodeResponse {
+            pub code: String,
+            pub state: StateResponse,
+            pub locality: Option<LocalityResponse>,
+            pub neighborhoods: Vec<LocalityResponse>,
+            pub population: i64, // widening leaf still funnels
+        }
+    }
+
+    // A neutral "service" module: owns neither type.
+    pub mod mappers {
+        use super::{db, dtos};
+        use magic_map::magic_map;
+
+        magic_map!(pub fn state_to_dto: db::State => dtos::StateResponse);
+        magic_map!(pub fn locality_to_dto: db::Locality => dtos::LocalityResponse);
+
+        // Nested `State`, `Option<Locality>`, `Vec<Locality>` and the i32→i64
+        // widening all auto-fill — no overrides, no hand-written recursion.
+        magic_map!(pub fn postal_code_to_dto: db::PostalCode => dtos::PostalCodeResponse);
+    }
+}
+
+#[test]
+fn fn_form_funnels_nested_foreign_pairs() {
+    use scoped::{db, dtos, mappers};
+
+    let src = db::PostalCode {
+        code: "97000".into(),
+        state: db::State {
+            name: "Yucatán".into(),
+        },
+        locality: Some(db::Locality {
+            name: "Mérida".into(),
+        }),
+        neighborhoods: vec![
+            db::Locality {
+                name: "Centro".into(),
+            },
+            db::Locality {
+                name: "Itzimná".into(),
+            },
+        ],
+        population: 921_770,
+    };
+
+    let dto = mappers::postal_code_to_dto(src).unwrap();
+    assert_eq!(dto.code, "97000");
+    assert_eq!(dto.state.name, "Yucatán");
+    assert_eq!(
+        dto.locality,
+        Some(dtos::LocalityResponse {
+            name: "Mérida".into()
+        })
+    );
+    assert_eq!(dto.neighborhoods.len(), 2);
+    assert_eq!(dto.neighborhoods[0].name, "Centro");
+    assert_eq!(dto.population, 921_770i64);
+}
+
+#[test]
+fn fn_form_none_stays_none() {
+    use scoped::{db, mappers};
+
+    let dto = mappers::postal_code_to_dto(db::PostalCode {
+        code: "00000".into(),
+        state: db::State { name: "X".into() },
+        locality: None,
+        neighborhoods: vec![],
+        population: 0,
+    })
+    .unwrap();
+    assert_eq!(dto.locality, None);
+    assert!(dto.neighborhoods.is_empty());
+}
+
+/// Leaves are found without being declared. Tier 1 of the probe holds only
+/// the concrete pairs the fn form emitted, so none of these has a candidate
+/// there and every one falls through to the `MapFrom` blanket. A regression
+/// that made tier 1 blanket-shaped would match these structurally and fail on
+/// the bound instead — which is exactly the bug this guards.
+#[test]
+fn leaves_resolve_through_the_probe_without_registration() {
+    use __magic_map_scope::{ProbeGlobal as _, ProbeLocal as _};
+    use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
+
+    macro_rules! probe {
+        ($src:expr, $ty:ty) => {{
+            let out: $ty = (&mut &mut magic_map::MapProbe::new($src))
+                .magic_probe()
+                .expect("leaf must resolve without registration");
+            out
+        }};
+    }
+
+    probe!(true, bool);
+    probe!('x', char);
+    probe!(1i8, i8);
+    probe!(1i16, i16);
+    probe!(1i32, i32);
+    probe!(1i64, i64);
+    probe!(1i128, i128);
+    probe!(1isize, isize);
+    probe!(1u8, u8);
+    probe!(1u16, u16);
+    probe!(1u32, u32);
+    probe!(1u64, u64);
+    probe!(1u128, u128);
+    probe!(1usize, usize);
+    probe!(1f32, f32);
+    probe!(1f64, f64);
+    probe!(String::from("s"), String);
+
+    // widenings
+    probe!(1u8, u16);
+    probe!(1i32, i64);
+    probe!(1f32, f64);
+
+    // feature leaves
+    let id = Uuid::from_u128(0x0192_3f4b_5c6d_7e8f_9012_3456_789a_bcde);
+    probe!(id, Uuid);
+    probe!(id, String);
+    probe!(id.to_string(), Uuid);
+
+    let d = Decimal::new(1995, 2);
+    probe!(d, Decimal);
+    probe!(d, f64);
+    probe!(d, String);
+    probe!(String::from("19.95"), Decimal);
+    probe!(19.95f64, Decimal);
+
+    let now: DateTime<Utc> = Utc::now();
+    probe!(now, DateTime<Utc>);
+    probe!(now, String);
+    probe!(now.to_rfc3339(), DateTime<Utc>);
+    let day = NaiveDate::from_ymd_opt(2026, 8, 9).unwrap();
+    probe!(day, NaiveDate);
+    probe!(day, String);
+    probe!(day.to_string(), NaiveDate);
+    probe!(now.naive_utc(), NaiveDateTime);
+    probe!(now.time(), NaiveTime);
+
+    probe!(serde_json::Value::Null, serde_json::Value);
+
+    // wrappers over leaves, still tier 2
+    probe!(vec![1i32, 2i32], Vec<i64>);
+    probe!(Some(id), Option<String>);
+
+    // …and a declared pair resolves through tier 1 in the very same scope, so
+    // the fallthrough above is a real fallthrough, not tier 1 being absent.
+    let state: scoped::dtos::StateResponse =
+        (&mut &mut magic_map::MapProbe::new(scoped::db::State {
+            name: "Yucatán".into(),
+        }))
+            .magic_probe()
+            .expect("declared pair must resolve through tier 1");
+    assert_eq!(state.name, "Yucatán");
+}
+
+// ── custom leaves ───────────────────────────────────────────────────────────
+
+mod custom_leaf {
+    /// A leaf declared the normal way, in the crate that owns it: `MapFrom`
+    /// impls the local trait cannot see until `leaves: [...]` names them.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub struct Celsius(pub i32);
+
+    magic_map::map_identity!(Celsius);
+
+    /// A generic wrapper, like `quickedge_commons::Patch<T>`: its `MapFrom`
+    /// impl is generic, so no list of concrete pairs can cover it.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub struct Wrap<T>(pub T);
+
+    impl<S, D: magic_map::MapFrom<S>> magic_map::MapFrom<Wrap<S>> for Wrap<D> {
+        fn map_from(src: Wrap<S>) -> Result<Self, magic_map::MappingError> {
+            Ok(Wrap(D::map_from(src.0)?))
+        }
+    }
+
+    impl magic_map::MapFrom<Celsius> for String {
+        fn map_from(src: Celsius) -> Result<Self, magic_map::MappingError> {
+            Ok(format!("{}C", src.0))
+        }
+    }
+}
+
+mod custom_leaf_use {
+    use super::custom_leaf::Celsius;
+    use magic_map::magic_map;
+
+    pub mod db {
+        #[derive(magic_map::MagicMap, Clone)]
+        pub struct Reading {
+            pub at: String,
+            pub temp: super::Celsius,
+            pub note: crate::custom_leaf::Wrap<i32>,
+        }
+    }
+    pub mod dtos {
+        #[derive(magic_map::MagicMap, Debug, PartialEq)]
+        pub struct ReadingResponse {
+            pub at: String,
+            pub temp: String, // Celsius → String, via the declared leaf
+            pub note: crate::custom_leaf::Wrap<i64>, // generic leaf + widening
+        }
+    }
+
+    magic_map!(pub fn reading_to_dto: db::Reading => dtos::ReadingResponse);
+}
+
+#[test]
+fn custom_and_generic_leaves_need_no_declaration() {
+    let dto = custom_leaf_use::reading_to_dto(custom_leaf_use::db::Reading {
+        at: "2026-08-09".into(),
+        temp: custom_leaf::Celsius(21),
+        note: custom_leaf::Wrap(7i32),
+    })
+    .unwrap();
+    assert_eq!(dto.temp, "21C");
+    assert_eq!(dto.note, custom_leaf::Wrap(7i64));
 }
