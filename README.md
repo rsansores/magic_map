@@ -180,7 +180,17 @@ disappears in either direction.
 When **neither** type is local — `wire::Lion` comes out of prost codegen,
 `db::Lion` out of the ORM, and you're mapping them in a neutral service
 crate — the orphan rule forbids any trait impl. The fn form generates a plain
-function instead:
+function instead.
+
+> **One-time setup:** a crate that uses the fn form must call
+> [`magic_map_scope!()`](#magic_map_scope--the-fn-forms-crate-local-funnel)
+> once in its crate root. Skip it and the first fn-form mapping fails with
+> ``could not find `__magic_map_scope` in the crate root``.
+
+```rust
+// src/lib.rs — once per crate
+magic_map::magic_map_scope!();
+```
 
 ```rust
 mod wire {
@@ -214,6 +224,99 @@ assert_eq!(row.name, "Simba");
 let bad = lion_to_db(wire::Lion { id: "not-a-uuid".into(), name: "?".into() });
 assert!(bad.is_err());
 ```
+
+### `magic_map_scope!` — the fn form's crate-local funnel
+
+**When you need it:** any crate that declares a fn-form mapping. Call it once,
+at the crate root (`lib.rs`, `main.rs`, or the top of an integration test —
+integration tests are their own crate). Crates whose mappings are all impl
+form never call it.
+
+**Why it exists.** A mapping's *fields* funnel through `MapFrom` too. That is
+fine for the impl form, which leaves a `MapFrom` impl behind for the next
+mapping to find. The fn form leaves none — so before this existed, a nested
+field whose own mapping was also foreign→foreign had nothing to resolve
+against, and you hand-wrote the recursion:
+
+```rust
+// the old way — every nested pair spelled out
+magic_map!(pub fn postal_code_to_dto: db::PostalCode => dtos::PostalCodeResponse {
+    state: state_to_dto(src.state)?,
+    locality: src.locality.map(locality_to_dto).transpose()?,
+    neighborhoods: src.neighborhoods.into_iter()
+        .map(locality_to_dto).collect::<Result<_, _>>()?,
+});
+```
+
+`magic_map_scope!()` plants a trait in *your* crate. The orphan rule is
+satisfied by a local trait just as well as by a local type, so
+`impl LocalMapFrom<Address> for AddressResponse` is legal there even though
+both types are foreign — and the fn form now emits one for every mapping it
+declares. Nested pairs, `Option`, `Vec` and the `..Default::default()` adaptor
+all compose again:
+
+```rust
+magic_map!(pub fn state_to_dto:    db::State    => dtos::StateResponse);
+magic_map!(pub fn locality_to_dto: db::Locality => dtos::LocalityResponse);
+
+// nested State, Option<Locality>, Vec<Locality> — no overrides needed
+magic_map!(pub fn postal_code_to_dto: db::PostalCode => dtos::PostalCodeResponse);
+```
+
+This is what lets mappers live in a crate that owns neither side — a services
+layer between a `*_db` crate and a `*_dtos` crate, with no dependency edge
+between the two.
+
+#### Leaves need no declaration
+
+Nothing to configure — not the built-in leaves, not your `map_identity!` /
+`map_display!` / `map_parse!` declarations, not a `MapFrom` impl you wrote by
+hand, not a generic wrapper like a `Patch<T>` update field. Declaring a mapping
+is the only way anything is ever registered.
+
+That falls out of how the tiers are built. Field resolution probes two of them
+by autoref, and the fn form emits **concrete** tier-1 impls — one per declared
+pair. A leaf pair therefore has no tier-1 candidate at all, so probing derefs
+straight to the tier-2 blanket over `MapFrom` and finds it there.
+
+The obvious alternative does not work, which is worth knowing if you ever touch
+this code. A *blanket* tier 1 —
+
+```rust
+impl<S, D: LocalMapFrom<S>> ProbeLocal<D> for &mut &mut MapProbe<S, D> { .. }
+```
+
+— matches every pair structurally, so the compiler commits to it and then
+reports the unsatisfied bound rather than falling through:
+
+```text
+error[E0277]: the trait bound `u16: LocalMapFrom<u8>` is not satisfied
+```
+
+Method probing selects a candidate by receiver shape and does **not** retry a
+lower tier when a where-bound fails. Concrete impls are what make the fallback
+real.
+
+#### Why the trait has to be local
+
+The shortcut — one blanket forwarding every existing `MapFrom` into the local
+trait — is not expressible either:
+
+```rust
+// rejected by coherence
+impl<S, D: MapFrom<S>> LocalMapFrom<S> for D { .. }
+```
+
+```text
+error[E0119]: conflicting implementations of trait `LocalMapFrom<Address>`
+              for type `AddressResponse`
+   = note: upstream crates may add a new impl of trait
+           `MapFrom<Address>` for type `AddressResponse` in future versions
+```
+
+It overlaps the per-pair impls and the compiler cannot rule that out, because
+either upstream crate could add the impl later. Hence a local trait carrying
+only declared pairs, and the probe reaching `MapFrom` for everything else.
 
 ### `let` preludes
 
@@ -566,6 +669,10 @@ impl magic_map::MapFrom<MyWireTimestamp> for chrono::DateTime<chrono::Utc> {
 }
 ```
 
+These automap everywhere — impl form and fn form alike. A fn-form crate needs
+[`magic_map_scope!()`](#magic_map_scope--the-fn-forms-crate-local-funnel) in
+its root, but nothing about your leaves has to be repeated there.
+
 [strum]: https://crates.io/crates/strum
 
 ## prost / generated-code recipe
@@ -601,6 +708,14 @@ decision for the handler that owns the batch, not for the conversion.
   crate-root export — rename one or use `#[magic_map(export = "...")]`.
 - Destination types must have named fields (or unit variants); tuple structs
   are not supported as destinations.
+- The fn form needs [`magic_map_scope!()`](#magic_map_scope--the-fn-forms-crate-local-funnel)
+  in the crate root — once, no arguments. Coherence allows no automatic bridge
+  from `MapFrom`, so the local trait cannot simply be derived; see that section
+  for the compiler's own reasoning.
+- A declared pair nested inside a *custom generic wrapper* (`Patch<Address>` →
+  `Patch<AddressResponse>`, as opposed to `Patch<String>` → `Patch<String>`)
+  has no tier-1 candidate; give that field an explicit override. Wrappers over
+  leaves, and `Option`/`Vec` over declared pairs, are handled.
 
 ## License
 

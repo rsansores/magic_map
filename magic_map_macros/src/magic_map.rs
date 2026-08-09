@@ -473,6 +473,12 @@ pub fn expand(raw: TokenStream2, input: ExpandInput) -> Result<TokenStream, syn:
     // the binder from a user-written token's span so they share context.
     let src_var = Ident::new("src", syn::spanned::Spanned::span(&src));
 
+    // The fn form is the foreign→foreign case: no `MapFrom` impl exists for
+    // this pair, so its fields resolve through the crate-local funnel that
+    // `magic_map_scope!` plants. The impl form keeps funnelling through
+    // `MapFrom` and needs no scope.
+    let local = func.is_some();
+
     let body = if dest_shape.is_enum {
         if tuple_elems.is_some() {
             return Err(syn::Error::new_spanned(
@@ -630,15 +636,43 @@ pub fn expand(raw: TokenStream2, input: ExpandInput) -> Result<TokenStream, syn:
                 // their inner value (None → default instance's field); plain
                 // funnel next (Option→Option stays None→None); plain source
                 // into an `Option` dest wraps in `Some`.
+                // The fn form has no `MapFrom` impl to funnel through, so it
+                // reads the crate-local trait `magic_map_scope!` planted —
+                // same three autoref tiers, local names.
+                // Six tiers for the fn form: the three local shapes, which
+                // only a declared pair populates, then the three global ones a
+                // leaf falls through to. Three for the impl form, which has
+                // `MapFrom` to lean on.
+                if local {
+                    assigns.push(quote! { #f: {
+                        use crate::__magic_map_scope::{
+                            GlobalFieldOpt as _, GlobalFieldVal as _, GlobalFieldWrap as _,
+                            LocalFieldOpt as _, LocalFieldVal as _, LocalFieldWrap as _,
+                        };
+                        (&mut &mut &mut &mut &mut &mut ::magic_map::MapPair(
+                            ::core::option::Option::Some(#access),
+                            ::core::option::Option::Some(__magic_fb.#f),
+                        ))
+                            .magic_field()?
+                    } });
+                } else {
+                    assigns.push(quote! { #f: {
+                        use ::magic_map::{
+                            MapFieldOpt as _, MapFieldVal as _, MapFieldWrap as _,
+                        };
+                        (&mut &mut &mut ::magic_map::MapPair(
+                            ::core::option::Option::Some(#access),
+                            ::core::option::Option::Some(__magic_fb.#f),
+                        ))
+                            .map_field_or()?
+                    } });
+                }
+            } else if local {
+                // Tier 1 holds only declared pairs, so a leaf finds no
+                // candidate and probing derefs to the `MapFrom` blanket.
                 assigns.push(quote! { #f: {
-                    use ::magic_map::{
-                        MapFieldOpt as _, MapFieldVal as _, MapFieldWrap as _,
-                    };
-                    (&mut &mut &mut ::magic_map::MapPair(
-                        ::core::option::Option::Some(#access),
-                        ::core::option::Option::Some(__magic_fb.#f),
-                    ))
-                        .map_field_or()?
+                    use crate::__magic_map_scope::{ProbeGlobal as _, ProbeLocal as _};
+                    (&mut &mut ::magic_map::MapProbe::new(#access)).magic_probe()?
                 } });
             } else {
                 assigns.push(quote! { #f: ::magic_map::MapFrom::map_from(#access)? });
@@ -669,6 +703,15 @@ pub fn expand(raw: TokenStream2, input: ExpandInput) -> Result<TokenStream, syn:
             ) -> ::core::result::Result<#dest, ::magic_map::MappingError> {
                 #body
             }
+
+            // Registers the pair in the crate-local funnel, so a *different*
+            // fn-form mapping can auto-fill a nested field of this type. The
+            // orphan rule permits it because the trait is local even when both
+            // types are foreign, and the impls are concrete so they never
+            // shadow a leaf's route to `MapFrom`.
+            ::magic_map::__magic_map_declare_local!(
+                crate::__magic_map_scope, #name, #src, #dest
+            );
         },
         None => quote! {
             impl ::magic_map::MapFrom<#src> for #dest {
