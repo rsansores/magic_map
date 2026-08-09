@@ -639,41 +639,38 @@ pub fn expand(raw: TokenStream2, input: ExpandInput) -> Result<TokenStream, syn:
                 // The fn form has no `MapFrom` impl to funnel through, so it
                 // reads the crate-local trait `magic_map_scope!` planted —
                 // same three autoref tiers, local names.
-                // Six tiers for the fn form: the three local shapes, which
-                // only a declared pair populates, then the three global ones a
-                // leaf falls through to. Three for the impl form, which has
-                // `MapFrom` to lean on.
-                if local {
-                    assigns.push(quote! { #f: {
-                        use crate::__magic_map_scope::{
-                            GlobalFieldOpt as _, GlobalFieldVal as _, GlobalFieldWrap as _,
-                            LocalFieldOpt as _, LocalFieldVal as _, LocalFieldWrap as _,
-                        };
-                        (&mut &mut &mut &mut &mut &mut ::magic_map::MapPair(
-                            ::core::option::Option::Some(#access),
-                            ::core::option::Option::Some(__magic_fb.#f),
-                        ))
-                            .magic_field()?
-                    } });
+                // The fn form funnels through the crate-local trait, which
+                // has no `MapFrom` impl for a foreign→foreign pair to reach.
+                // Same three autoref tiers, local names.
+                let (opt, val, wrap, probe) = if local {
+                    (
+                        quote! { crate::__magic_map_scope::LocalFieldOpt as _ },
+                        quote! { crate::__magic_map_scope::LocalFieldVal as _ },
+                        quote! { crate::__magic_map_scope::LocalFieldWrap as _ },
+                        quote! { local_map_field_or },
+                    )
                 } else {
-                    assigns.push(quote! { #f: {
-                        use ::magic_map::{
-                            MapFieldOpt as _, MapFieldVal as _, MapFieldWrap as _,
-                        };
-                        (&mut &mut &mut ::magic_map::MapPair(
-                            ::core::option::Option::Some(#access),
-                            ::core::option::Option::Some(__magic_fb.#f),
-                        ))
-                            .map_field_or()?
-                    } });
-                }
-            } else if local {
-                // Tier 1 holds only declared pairs, so a leaf finds no
-                // candidate and probing derefs to the `MapFrom` blanket.
+                    (
+                        quote! { ::magic_map::MapFieldOpt as _ },
+                        quote! { ::magic_map::MapFieldVal as _ },
+                        quote! { ::magic_map::MapFieldWrap as _ },
+                        quote! { map_field_or },
+                    )
+                };
                 assigns.push(quote! { #f: {
-                    use crate::__magic_map_scope::{ProbeGlobal as _, ProbeLocal as _};
-                    (&mut &mut ::magic_map::MapProbe::new(#access)).magic_probe()?
+                    use #opt;
+                    use #val;
+                    use #wrap;
+                    (&mut &mut &mut ::magic_map::MapPair(
+                        ::core::option::Option::Some(#access),
+                        ::core::option::Option::Some(__magic_fb.#f),
+                    ))
+                        .#probe()?
                 } });
+            } else if local {
+                assigns.push(quote! {
+                    #f: crate::__magic_map_scope::LocalMapFrom::local_map_from(#access)?
+                });
             } else {
                 assigns.push(quote! { #f: ::magic_map::MapFrom::map_from(#access)? });
             }
@@ -709,9 +706,13 @@ pub fn expand(raw: TokenStream2, input: ExpandInput) -> Result<TokenStream, syn:
             // orphan rule permits it because the trait is local even when both
             // types are foreign, and the impls are concrete so they never
             // shadow a leaf's route to `MapFrom`.
-            ::magic_map::__magic_map_declare_local!(
-                crate::__magic_map_scope, #name, #src, #dest
-            );
+            impl crate::__magic_map_scope::LocalMapFrom<#src> for #dest {
+                fn local_map_from(
+                    src: #src,
+                ) -> ::core::result::Result<Self, ::magic_map::MappingError> {
+                    #name(src)
+                }
+            }
         },
         None => quote! {
             impl ::magic_map::MapFrom<#src> for #dest {
@@ -722,6 +723,153 @@ pub fn expand(raw: TokenStream2, input: ExpandInput) -> Result<TokenStream, syn:
                 }
             }
         },
+    }
+    .into())
+}
+
+// ── 4. magic_map_leaves! — declare a crate's leaves, and publish them ────────
+//
+// A consumer's `magic_map_scope!` needs every leaf pair as a `LocalMapFrom`
+// impl (the trait is a closed world — see the runtime crate for why there can
+// be no bridge). Nobody should transcribe those by hand, and no macro can
+// discover them: macro expansion sees only its own tokens, never a crate's
+// impls. So a crate states its leaves once here, and this emits a `macro_rules!`
+// republishing the pairs for `scope!` to replay.
+//
+// It is a proc macro for the same reason the schema derive is: generating a
+// `macro_rules!` from a `macro_rules!` cannot express the inner `$`, while
+// `quote!` interpolates on `#` and passes `$` straight through.
+
+pub struct LeavesInput {
+    identity: Vec<syn::Path>,
+    display: Vec<syn::Path>,
+    parse: Vec<syn::Path>,
+    custom: Vec<(syn::Type, syn::Type)>,
+}
+
+impl Parse for LeavesInput {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let (mut identity, mut display, mut parse, mut custom) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        while !input.is_empty() {
+            let key: Ident = input.parse()?;
+            input.parse::<Token![:]>()?;
+            let content;
+            syn::bracketed!(content in input);
+            match key.to_string().as_str() {
+                "identity" | "display" | "parse" => {
+                    let paths = Punctuated::<syn::Path, Token![,]>::parse_terminated(&content)?;
+                    let target = match key.to_string().as_str() {
+                        "identity" => &mut identity,
+                        "display" => &mut display,
+                        _ => &mut parse,
+                    };
+                    target.extend(paths);
+                }
+                "custom" => {
+                    while !content.is_empty() {
+                        let src: syn::Type = content.parse()?;
+                        content.parse::<Token![=>]>()?;
+                        let dest: syn::Type = content.parse()?;
+                        custom.push((src, dest));
+                        if content.peek(Token![,]) {
+                            content.parse::<Token![,]>()?;
+                        }
+                    }
+                }
+                other => {
+                    return Err(syn::Error::new(
+                        key.span(),
+                        format!(
+                            "`{other}` is not a leaf kind — expected \
+                             `identity`, `display`, `parse` or `custom`"
+                        ),
+                    ))
+                }
+            }
+            if input.peek(Token![,]) {
+                input.parse::<Token![,]>()?;
+            }
+        }
+        Ok(Self {
+            identity,
+            display,
+            parse,
+            custom,
+        })
+    }
+}
+
+/// Rewrites a leading `crate::` to `$crate::` so the published pair resolves
+/// against the declaring crate rather than whoever replays it. Everything else
+/// is left alone.
+fn republish(tokens: TokenStream2) -> TokenStream2 {
+    let text = tokens.to_string();
+    if let Some(rest) = text.strip_prefix("crate ::") {
+        let rest: TokenStream2 = rest.parse().unwrap_or_default();
+        quote! { $crate::#rest }
+    } else {
+        tokens
+    }
+}
+
+pub fn leaves(input: LeavesInput) -> Result<TokenStream, syn::Error> {
+    let LeavesInput {
+        identity,
+        display,
+        parse,
+        custom,
+    } = input;
+
+    // Impls land in this crate, where the paths are written as the user wrote
+    // them — `crate::` means this crate here, which is correct.
+    let impls = quote! {
+        #(::magic_map::map_identity!(#identity);)*
+        #(::magic_map::map_display!(#display);)*
+        #(::magic_map::map_parse!(#parse);)*
+    };
+
+    // The published list is expanded in *another* crate, so own-crate paths
+    // have to travel as `$crate::`.
+    let mut pairs: Vec<(TokenStream2, TokenStream2)> = Vec::new();
+    for p in &identity {
+        let t = republish(quote! { #p });
+        pairs.push((t.clone(), t));
+    }
+    for p in &display {
+        pairs.push((republish(quote! { #p }), quote! { ::std::string::String }));
+    }
+    for p in &parse {
+        pairs.push((quote! { ::std::string::String }, republish(quote! { #p })));
+    }
+    for (src, dest) in &custom {
+        pairs.push((republish(quote! { #src }), republish(quote! { #dest })));
+    }
+
+    let replays = pairs.iter().map(|(src, dest)| {
+        quote! {
+            impl LocalMapFrom<#src> for #dest {
+                fn local_map_from(
+                    src: #src,
+                ) -> ::core::result::Result<Self, ::magic_map::MappingError> {
+                    <#dest as ::magic_map::MapFrom<#src>>::map_from(src)
+                }
+            }
+        }
+    });
+
+    Ok(quote! {
+        #impls
+
+        /// This crate's leaf pairs, as `LocalMapFrom` impls. Expanded by
+        /// `magic_map_scope!`'s `from:` inside the scope module, where
+        /// `LocalMapFrom` is in scope — `macro_rules!` is not hygienic for item
+        /// names, so the bare trait name binds at the expansion site.
+        #[doc(hidden)]
+        #[macro_export]
+        macro_rules! __magic_map_leaves {
+            () => { #(#replays)* };
+        }
     }
     .into())
 }

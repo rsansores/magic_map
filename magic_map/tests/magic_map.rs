@@ -5,7 +5,17 @@
 
 // Integration tests are their own crate, so the scope lives here rather than
 // in a lib.rs — same rule: once, at the crate root.
-magic_map::magic_map_scope!();
+magic_map::magic_map_scope! {
+    // Everything `leaf_provider` declares, replayed without restating a type.
+    from: [leaf_provider],
+    // Escape hatches: a one-off pair whose crate has no block, and a generic
+    // wrapper whose own MapFrom impl is generic.
+    leaves: [custom_leaf::Celsius, custom_leaf::Celsius => String,
+             shared_source::db::Kind => String],
+    generic_leaves: {
+        <S, D> custom_leaf::Wrap<S> => custom_leaf::Wrap<D> where D: magic_map::MapFrom<S>;
+    },
+}
 use magic_map::magic_map;
 use magic_map::{MapFrom, MapInto, MappingError};
 use rust_decimal::Decimal;
@@ -856,94 +866,70 @@ fn fn_form_none_stays_none() {
     assert!(dto.neighborhoods.is_empty());
 }
 
-/// Leaves are found without being declared. Tier 1 of the probe holds only
-/// the concrete pairs the fn form emitted, so none of these has a candidate
-/// there and every one falls through to the `MapFrom` blanket. A regression
-/// that made tier 1 blanket-shaped would match these structurally and fail on
-/// the bound instead — which is exactly the bug this guards.
+/// Regression guard for the bug that killed the two-tier probe design.
+///
+/// `ApplicationType` here stands for any enum with BOTH a declared
+/// foreign→foreign mapping (to its DTO twin) and a leaf conversion to a
+/// different destination (`map_display!` to `String`, for a proto). Under a
+/// probe keyed on the source type alone, the declared pair won and the field
+/// silently resolved to the wrong destination — `expected String, found
+/// ApplicationTypeDto`. One funnel cannot make that mistake: each pair is a
+/// distinct `LocalMapFrom` impl.
 #[test]
-fn leaves_resolve_through_the_probe_without_registration() {
-    use __magic_map_scope::{ProbeGlobal as _, ProbeLocal as _};
-    use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
+fn shared_source_reaches_both_its_declared_pair_and_its_leaf() {
+    use shared_source::{db, dtos, mappers};
 
-    macro_rules! probe {
-        ($src:expr, $ty:ty) => {{
-            let out: $ty = (&mut &mut magic_map::MapProbe::new($src))
-                .magic_probe()
-                .expect("leaf must resolve without registration");
-            out
-        }};
+    let dto = mappers::row_to_dto(db::Row {
+        kind: db::Kind::Mobile,
+        label: db::Kind::Mobile,
+    })
+    .unwrap();
+    // same source type, two destinations, both correct
+    assert_eq!(dto.kind, dtos::KindDto::Mobile);
+    assert_eq!(dto.label, "Mobile");
+}
+
+mod shared_source {
+    pub mod db {
+        #[derive(Clone, Copy, PartialEq, strum::Display, magic_map::MagicMap)]
+        pub enum Kind {
+            Mobile,
+            Fixed,
+        }
+        magic_map::map_display!(Kind);
+
+        #[derive(magic_map::MagicMap)]
+        #[magic_map(export = "SharedRow")]
+        pub struct Row {
+            pub kind: Kind,
+            pub label: Kind,
+        }
     }
-
-    probe!(true, bool);
-    probe!('x', char);
-    probe!(1i8, i8);
-    probe!(1i16, i16);
-    probe!(1i32, i32);
-    probe!(1i64, i64);
-    probe!(1i128, i128);
-    probe!(1isize, isize);
-    probe!(1u8, u8);
-    probe!(1u16, u16);
-    probe!(1u32, u32);
-    probe!(1u64, u64);
-    probe!(1u128, u128);
-    probe!(1usize, usize);
-    probe!(1f32, f32);
-    probe!(1f64, f64);
-    probe!(String::from("s"), String);
-
-    // widenings
-    probe!(1u8, u16);
-    probe!(1i32, i64);
-    probe!(1f32, f64);
-
-    // feature leaves
-    let id = Uuid::from_u128(0x0192_3f4b_5c6d_7e8f_9012_3456_789a_bcde);
-    probe!(id, Uuid);
-    probe!(id, String);
-    probe!(id.to_string(), Uuid);
-
-    let d = Decimal::new(1995, 2);
-    probe!(d, Decimal);
-    probe!(d, f64);
-    probe!(d, String);
-    probe!(String::from("19.95"), Decimal);
-    probe!(19.95f64, Decimal);
-
-    let now: DateTime<Utc> = Utc::now();
-    probe!(now, DateTime<Utc>);
-    probe!(now, String);
-    probe!(now.to_rfc3339(), DateTime<Utc>);
-    let day = NaiveDate::from_ymd_opt(2026, 8, 9).unwrap();
-    probe!(day, NaiveDate);
-    probe!(day, String);
-    probe!(day.to_string(), NaiveDate);
-    probe!(now.naive_utc(), NaiveDateTime);
-    probe!(now.time(), NaiveTime);
-
-    probe!(serde_json::Value::Null, serde_json::Value);
-
-    // wrappers over leaves, still tier 2
-    probe!(vec![1i32, 2i32], Vec<i64>);
-    probe!(Some(id), Option<String>);
-
-    // …and a declared pair resolves through tier 1 in the very same scope, so
-    // the fallthrough above is a real fallthrough, not tier 1 being absent.
-    let state: scoped::dtos::StateResponse =
-        (&mut &mut magic_map::MapProbe::new(scoped::db::State {
-            name: "Yucatán".into(),
-        }))
-            .magic_probe()
-            .expect("declared pair must resolve through tier 1");
-    assert_eq!(state.name, "Yucatán");
+    pub mod dtos {
+        #[derive(Debug, Clone, Copy, PartialEq, magic_map::MagicMap)]
+        pub enum KindDto {
+            Mobile,
+            Fixed,
+        }
+        #[derive(magic_map::MagicMap)]
+        pub struct RowResponse {
+            pub kind: KindDto,
+            pub label: String,
+        }
+    }
+    pub mod mappers {
+        use super::{db, dtos};
+        use magic_map::magic_map;
+        magic_map!(pub fn kind_to_dto: db::Kind => dtos::KindDto);
+        magic_map!(pub fn row_to_dto: db::Row => dtos::RowResponse);
+    }
 }
 
 // ── custom leaves ───────────────────────────────────────────────────────────
 
 mod custom_leaf {
-    /// A leaf declared the normal way, in the crate that owns it: `MapFrom`
-    /// impls the local trait cannot see until `leaves: [...]` names them.
+    /// A leaf declared the normal way, in the crate that owns it — reached
+    /// through the scope's `leaves:` escape hatch rather than the registry.
     #[derive(Clone, Copy, Debug, PartialEq)]
     pub struct Celsius(pub i32);
 
@@ -1001,4 +987,35 @@ fn custom_and_generic_leaves_need_no_declaration() {
     .unwrap();
     assert_eq!(dto.temp, "21C");
     assert_eq!(dto.note, custom_leaf::Wrap(7i64));
+}
+
+/// The cross-crate half of the registry: `leaf_provider` declared these leaves
+/// in its own crate root and this crate names only the crate, never a type.
+/// Adding a leaf there must reach here with no edit in this file — which is the
+/// entire reason the registry exists.
+#[test]
+fn leaves_arrive_from_a_provider_crate() {
+    mod dtos {
+        #[derive(Debug, PartialEq, magic_map::MagicMap)]
+        #[magic_map(export = "ProviderReadingResponse")]
+        pub struct ReadingResponse {
+            pub species: leaf_provider::enums::Species, // identity
+            pub species_label: String,                  // display
+            pub temp: String,                           // hand-written MapFrom
+        }
+    }
+
+    magic_map::magic_map!(pub fn reading_to_dto:
+        leaf_provider::Reading => dtos::ReadingResponse);
+
+    let dto = reading_to_dto(leaf_provider::Reading {
+        species: leaf_provider::enums::Species::Lion,
+        species_label: leaf_provider::enums::Species::Lion,
+        temp: leaf_provider::wire::Fahrenheit(72),
+    })
+    .unwrap();
+
+    assert_eq!(dto.species, leaf_provider::enums::Species::Lion);
+    assert_eq!(dto.species_label, "Lion");
+    assert_eq!(dto.temp, "72F");
 }

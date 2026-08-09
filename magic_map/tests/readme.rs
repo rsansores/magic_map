@@ -9,7 +9,7 @@
 
 // The fn-form examples below need the crate-local funnel; see the README's
 // `magic_map_scope!` section. Once, at the crate root, no arguments.
-magic_map::magic_map_scope!();
+magic_map::magic_map_scope!(from: [leaf_provider]);
 
 use magic_map::{MapInto, MappingError};
 

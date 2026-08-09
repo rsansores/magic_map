@@ -450,6 +450,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "leaf_provider"
+version = "0.0.0"
+dependencies = [
+ "magic_map",
+ "strum",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -472,6 +480,7 @@ name = "magic_map"
 version = "0.3.0"
 dependencies = [
  "chrono",
+ "leaf_provider",
  "magic_map",
  "magic_map_macros",
  "rust_decimal",
