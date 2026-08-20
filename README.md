@@ -1,5 +1,7 @@
 # magic_map
 
+> Upgrading from 0.3? See [MIGRATING.md](./MIGRATING.md) — one rename, three new capabilities.
+
 Declaration-site, fallible struct/enum mapping for Rust — automap between
 types you **don't own** (DB rows, prost-generated protos, OpenAPI DTOs) with
 strict, compile-checked conversions.
@@ -651,6 +653,72 @@ ever called.
 > `MappingError` as a `HashMap` key) is.
 
 [validator]: https://crates.io/crates/validator
+
+## Fallible and infallible
+
+Two pairs, mirroring `From` / `TryFrom`:
+
+| | infallible | fallible |
+|---|---|---|
+| trait | `MapFrom` / `MapInto` | `TryMapFrom` / `TryMapInto` |
+| method | `map_from` / `map_into` | `try_map_from` / `try_map_into` |
+| returns | `Self` | `Result<Self, MappingError>` |
+| declared | `magic_map!(infallible …)` | `magic_map!(…)` |
+
+A mapping is infallible when every field pair is an identity, a lossless
+widening, or another infallible mapping. `String` → `Uuid` parses, so it is not.
+
+```rust
+magic_map!(infallible db::Tenant => wire::Tenant);
+
+let t: wire::Tenant = row.map_into();   // no `?`
+```
+
+The claim is checked rather than trusted: the expansion contains no `?`, so a
+field pair with only a `TryMapFrom` route fails to resolve. Infallible mappings
+also get the fallible half generated, so `try_map_into()` keeps working on them.
+
+Sources may be borrowed:
+
+```rust
+magic_map!(infallible fn fiscal: &CompanyPayload => FiscalFields { … });
+```
+
+## Sealing — `#[mapped(sealed)]`
+
+The failure worth preventing is not a wrong `From` impl. It is the
+field-by-field copy typed straight into a service or a controller, using no
+trait at all — which no linter catches reliably, since a grep cannot tell
+construction from destructuring.
+
+`#[mapped(sealed)]` adds `#[non_exhaustive]` and a hidden all-fields
+constructor. From any other crate the type then has no struct expression:
+
+```rust
+#[mapped(sealed)]                       // must come before the derives
+#[derive(Serialize, Deserialize, Clone)]
+pub struct CustomerDto { … }
+```
+```
+error[E0639]: cannot create non-exhaustive struct using struct expression
+```
+
+`magic_map!` builds through the constructor, so declared mappings are
+unaffected. Banning `impl From` needs no separate feature — a `From` impl for a
+sealed type cannot construct its own output either.
+
+It is an attribute, not a derive, because a derive is additive-only and can
+never place an attribute on the item it derives. It is `#[mapped]` rather than
+`#[magic_map]` because the latter would collide with the `magic_map!` macro.
+
+Sealing reaches any type whose owning crate is not the one doing the mapping —
+in a layered codebase, that is DTOs, database models and generated protos. It
+does **not** reach types local to the mapping crate, conversions *out of* a
+sealed type, or anything not sealed. `#[mapped]` with no argument is exactly
+`#[derive(MagicMap)]`, so adoption is per-type.
+
+`#[mapped]` skips shapes where sealing would only cost: unit and tuple structs,
+enums, and field-less markers such as a proto `Empty`.
 
 ## Leaves
 
