@@ -9,15 +9,15 @@ magic_map::magic_map_scope! {
     // Everything `leaf_provider` declares, replayed without restating a type.
     from: [leaf_provider],
     // Escape hatches: a one-off pair whose crate has no block, and a generic
-    // wrapper whose own MapFrom impl is generic.
+    // wrapper whose own TryMapFrom impl is generic.
     leaves: [custom_leaf::Celsius, custom_leaf::Celsius => String,
              shared_source::db::Kind => String],
     generic_leaves: {
-        <S, D> custom_leaf::Wrap<S> => custom_leaf::Wrap<D> where D: magic_map::MapFrom<S>;
+        <S, D> custom_leaf::Wrap<S> => custom_leaf::Wrap<D> where D: magic_map::TryMapFrom<S>;
     },
 }
 use magic_map::magic_map;
-use magic_map::{MapFrom, MapInto, MappingError};
+use magic_map::{TryMapFrom, TryMapInto, MappingError};
 use rust_decimal::Decimal;
 use uuid::Uuid;
 
@@ -147,7 +147,7 @@ fn sample() -> db::License {
 
 #[test]
 fn struct_impl_form_auto_fills_and_applies_overrides() {
-    let dto: dtos::LicenseResponse = sample().map_into().unwrap();
+    let dto: dtos::LicenseResponse = sample().try_map_into().unwrap();
     assert_eq!(dto.id, Uuid::nil()); // identity leaf
     assert_eq!(dto.status, dtos::StatusDto::Active); // nested enum map
     assert_eq!(dto.max_devices, 10); // identity leaf
@@ -161,9 +161,9 @@ fn struct_impl_form_auto_fills_and_applies_overrides() {
 
 #[test]
 fn enum_impl_form_maps_both_directions() {
-    let dto: dtos::StatusDto = db::Status::Suspended.map_into().unwrap();
+    let dto: dtos::StatusDto = db::Status::Suspended.try_map_into().unwrap();
     assert_eq!(dto, dtos::StatusDto::Suspended);
-    let back: db::Status = dto.map_into().unwrap();
+    let back: db::Status = dto.try_map_into().unwrap();
     assert_eq!(back, db::Status::Suspended);
 }
 
@@ -177,7 +177,7 @@ fn fn_form_generates_a_plain_function() {
 
 #[test]
 fn tuple_source_struct_plus_primitive() {
-    let dto: dtos::LicenseResponse = (sample(), 7i64).map_into().unwrap();
+    let dto: dtos::LicenseResponse = (sample(), 7i64).try_map_into().unwrap();
     assert_eq!(dto.devices_used, 7); // override from opaque element
     assert_eq!(dto.status, dtos::StatusDto::Active); // auto from src.0
     assert_eq!(dto.max_devices, 10); // auto from src.0
@@ -191,7 +191,7 @@ fn tuple_source_multi_struct_with_collision_override() {
         name: "acme".into(),
     };
     let card: dtos::LicenseCard = (sample(), owner, Some("vip".to_string()))
-        .map_into()
+        .try_map_into()
         .unwrap();
     assert_eq!(card.id, Uuid::max()); // collision resolved by override
     assert_eq!(card.name, "acme"); // auto: only Owner has `name`
@@ -395,7 +395,7 @@ fn defaults_trailer_wraps_plain_sources_into_option_dests() {
         count: 3,
         note: None,
     }
-    .map_into()
+    .try_map_into()
     .expect("wrap automap");
     assert_eq!(row.code.as_deref(), Some("EQ-1"));
     assert_eq!(row.owner_id, Some(id));
@@ -411,7 +411,7 @@ fn wrap_tier_is_strict_through_the_funnel() {
         count: 0,
         note: None,
     };
-    let res: Result<wrap::SyncRow, MappingError> = bad.map_into();
+    let res: Result<wrap::SyncRow, MappingError> = bad.try_map_into();
     assert!(res.is_err(), "garbage must not become Some(default)");
 }
 
@@ -435,7 +435,7 @@ fn defaults_trailer_unwraps_options_with_instance_fallback() {
         kind: Some(dtos::StatusDto::Suspended),
         note: Some("n".into()),
     }
-    .map_into()
+    .try_map_into()
     .unwrap();
     assert_eq!(row.label, "l"); // plain funnel
     assert_eq!(row.max_devices, 15); // None -> business default from instance
@@ -448,7 +448,7 @@ fn defaults_trailer_unwraps_options_with_instance_fallback() {
         kind: None,
         note: None,
     }
-    .map_into()
+    .try_map_into()
     .unwrap();
     assert_eq!(row2.max_devices, 3); // Some -> unwrapped
     assert_eq!(row2.kind, db::Status::Active); // None -> default variant
@@ -460,7 +460,7 @@ fn defaults_trailer_fills_missing_fields() {
     let row: sparse::UpdateRow = sparse::PatchRequest {
         name: Some("n".into()),
     }
-    .map_into()
+    .try_map_into()
     .unwrap();
     assert_eq!(row.name.as_deref(), Some("n"));
     assert_eq!(row.status, None);
@@ -484,7 +484,7 @@ magic_map!((schemaless::Untouchable, i32) => dtos::StatusDto2Holder {
 #[test]
 fn tuple_all_overridden_needs_no_schemas() {
     let h: dtos::StatusDto2Holder = (schemaless::Untouchable { reason: "r".into() }, 7)
-        .map_into()
+        .try_map_into()
         .unwrap();
     assert_eq!(h.code, 7);
     assert_eq!(h.reason, "r");
@@ -519,7 +519,7 @@ fn validated_dest_passes_when_data_is_valid() {
         name: "Alice".into(),
         email: "alice@example.com".into(),
     }
-    .map_into()
+    .try_map_into()
     .unwrap();
     assert_eq!(dto.name, "Alice");
 }
@@ -531,7 +531,7 @@ fn validated_dest_errors_when_data_fails_constraints() {
         name: "".into(),
         email: "alice@example.com".into(),
     }
-    .map_into();
+    .try_map_into();
     assert!(
         matches!(result, Err(MappingError::Validation(_))),
         "expected Validation error, got {result:?}",
@@ -542,7 +542,7 @@ fn validated_dest_errors_when_data_fails_constraints() {
         name: "Alice".into(),
         email: "not-an-email".into(),
     }
-    .map_into();
+    .try_map_into();
     assert!(matches!(result2, Err(MappingError::Validation(_))));
 }
 
@@ -586,7 +586,7 @@ fn validated_dest_with_defaults_trailer() {
         name: "Misifu".into(),
         note: None,
     }
-    .map_into()
+    .try_map_into()
     .unwrap();
     assert_eq!(row.name, "Misifu");
     assert_eq!(row.status, "new");
@@ -596,7 +596,7 @@ fn validated_dest_with_defaults_trailer() {
         name: "".into(),
         note: None,
     }
-    .map_into();
+    .try_map_into();
     assert!(matches!(bad, Err(MappingError::Validation(_))));
 }
 
@@ -666,16 +666,16 @@ fn validated_dest_tuple_source_validates() {
 
 #[test]
 fn leaf_conversions() {
-    let u = Uuid::map_from("00000000-0000-0000-0000-000000000000".to_string()).unwrap();
+    let u = Uuid::try_map_from("00000000-0000-0000-0000-000000000000".to_string()).unwrap();
     assert_eq!(u, Uuid::nil());
     assert_eq!(
-        Uuid::map_from("not-a-uuid".to_string()),
+        Uuid::try_map_from("not-a-uuid".to_string()),
         Err(MappingError::InvalidUuid { field: "<uuid>" })
     );
-    let d = Decimal::map_from(20.5_f64).unwrap();
+    let d = Decimal::try_map_from(20.5_f64).unwrap();
     assert_eq!(d, Decimal::new(205, 1));
     assert_eq!(
-        Decimal::map_from(f64::NAN),
+        Decimal::try_map_from(f64::NAN),
         Err(MappingError::OutOfRange { field: "<decimal>" })
     );
 }
@@ -757,7 +757,7 @@ mod override_question_mark {
 //
 // The case the fn form could not express before: a mapper crate that owns
 // neither side. `db` and `dtos` stand in for `quickedge_db` / `quickedge_dtos`
-// — nothing in either knows the other exists, and no `MapFrom` impl between
+// — nothing in either knows the other exists, and no `TryMapFrom` impl between
 // them is legal anywhere.
 
 mod scoped {
@@ -935,19 +935,19 @@ mod custom_leaf {
 
     magic_map::map_identity!(Celsius);
 
-    /// A generic wrapper, like `quickedge_commons::Patch<T>`: its `MapFrom`
+    /// A generic wrapper, like `quickedge_commons::Patch<T>`: its `TryMapFrom`
     /// impl is generic, so no list of concrete pairs can cover it.
     #[derive(Clone, Copy, Debug, PartialEq)]
     pub struct Wrap<T>(pub T);
 
-    impl<S, D: magic_map::MapFrom<S>> magic_map::MapFrom<Wrap<S>> for Wrap<D> {
-        fn map_from(src: Wrap<S>) -> Result<Self, magic_map::MappingError> {
-            Ok(Wrap(D::map_from(src.0)?))
+    impl<S, D: magic_map::TryMapFrom<S>> magic_map::TryMapFrom<Wrap<S>> for Wrap<D> {
+        fn try_map_from(src: Wrap<S>) -> Result<Self, magic_map::MappingError> {
+            Ok(Wrap(D::try_map_from(src.0)?))
         }
     }
 
-    impl magic_map::MapFrom<Celsius> for String {
-        fn map_from(src: Celsius) -> Result<Self, magic_map::MappingError> {
+    impl magic_map::TryMapFrom<Celsius> for String {
+        fn try_map_from(src: Celsius) -> Result<Self, magic_map::MappingError> {
             Ok(format!("{}C", src.0))
         }
     }
@@ -1001,7 +1001,7 @@ fn leaves_arrive_from_a_provider_crate() {
         pub struct ReadingResponse {
             pub species: leaf_provider::enums::Species, // identity
             pub species_label: String,                  // display
-            pub temp: String,                           // hand-written MapFrom
+            pub temp: String,                           // hand-written TryMapFrom
         }
     }
 

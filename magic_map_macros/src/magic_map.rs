@@ -13,12 +13,12 @@
 //!      function-like macro cannot see `Dest`'s fields, so it expands to a call
 //!      of `Dest`'s schema macro (rewriting the last path segment), which…
 //!   3. …calls back into `__magic_map_expand!` with the field list spliced in,
-//!      which generates the real `impl MapFrom<Src> for Dest` — or a plain
+//!      which generates the real `impl TryMapFrom<Src> for Dest` — or a plain
 //!      `fn` for the foreign→foreign case (e.g. db→proto in a service crate)
 //!      where the orphan rule forbids any impl.
 //!
 //! Every non-overridden destination field is pulled from `src.<same name>`
-//! through the `magic_map::MapFrom` leaf funnel, so String→Uuid,
+//! through the `magic_map::TryMapFrom` leaf funnel, so String→Uuid,
 //! Decimal↔f64, Option/Vec wrappers and mapped enums compose for free.
 
 use proc_macro::TokenStream;
@@ -31,6 +31,100 @@ use syn::{Data, DeriveInput, Fields, Ident, Path, Token};
 // ── 1. #[derive(MagicMap)] — metadata only ───────────────────────────────────
 
 pub fn derive(input: DeriveInput) -> Result<TokenStream, syn::Error> {
+    schema_for(&input, false)
+}
+
+/// `#[mapped]` / `#[mapped(sealed)]` — the attribute form.
+///
+/// It exists because a *derive* cannot add an attribute to the item it is on:
+/// derives are additive-only, they see the item and emit new items beside it.
+/// Sealing needs `#[non_exhaustive]` *on* the struct, so it needs an attribute.
+///
+/// `sealed` is the whole reason to prefer it. It makes the type impossible to
+/// build with a struct expression from any other crate, which is not a style
+/// rule — it means a hand-rolled field-by-field copy in a service or a
+/// controller stops compiling, and so does an `impl From` for the type, since
+/// that impl's body cannot construct its own output either. Mapping code goes
+/// through `magic_map!`, which constructs via the hidden constructor below.
+///
+/// The constructor is `pub` because the expansion lives in the caller's crate
+/// and macro expansions hold no privilege a hand-written line does not. Someone
+/// determined can call it. The point is that the wrong path stops being the
+/// easy invisible one and becomes a positional call with a name that reads as
+/// an accusation in review.
+pub fn mapped(attr: TokenStream2, item: TokenStream2) -> Result<TokenStream, syn::Error> {
+    let mut sealed = false;
+    if !attr.is_empty() {
+        let parser = syn::meta::parser(|meta| {
+            if meta.path.is_ident("sealed") {
+                sealed = true;
+                Ok(())
+            } else if meta.path.is_ident("export") {
+                let _: syn::LitStr = meta.value()?.parse()?;
+                Ok(())
+            } else {
+                Err(meta.error("expected `sealed` or `export = \"UniqueName\"`"))
+            }
+        });
+        syn::parse::Parser::parse2(parser, attr.clone())?;
+    }
+
+    let input: DeriveInput = syn::parse2(item)?;
+    let schema: TokenStream2 = schema_for(&input, sealed)?.into();
+
+    let named = match &input.data {
+        Data::Struct(d) => match &d.fields {
+            Fields::Named(n) => Some(n),
+            _ => None,
+        },
+        _ => None,
+    };
+
+    // Only a named-field struct can be sealed: there is nothing to seal on a
+    // unit or tuple struct, and an enum has no struct expression to block. A
+    // zero-field struct is a marker — `Empty {}` in a proto tree — and sealing
+    // one buys nothing while breaking every `Ok(Empty {})` in the tree.
+    let seal = match (sealed, named) {
+        (true, Some(n)) if !n.named.is_empty() => {
+            let name = &input.ident;
+            let (imp, ty, wher) = input.generics.split_for_impl();
+            let args: Vec<_> = n
+                .named
+                .iter()
+                .map(|f| {
+                    let id = f.ident.as_ref().unwrap();
+                    let t = &f.ty;
+                    quote! { #id: #t }
+                })
+                .collect();
+            let names: Vec<_> = n.named.iter().map(|f| f.ident.as_ref().unwrap()).collect();
+            (
+                quote! { #[non_exhaustive] },
+                quote! {
+                    impl #imp #name #ty #wher {
+                        #[doc(hidden)]
+                        #[allow(clippy::too_many_arguments)]
+                        pub fn __magic_map_new_unchecked(#(#args),*) -> Self {
+                            Self { #(#names),* }
+                        }
+                    }
+                },
+            )
+        }
+        _ => (TokenStream2::new(), TokenStream2::new()),
+    };
+    let (attr_tokens, ctor) = seal;
+
+    Ok(quote! {
+        #attr_tokens
+        #input
+        #ctor
+        #schema
+    }
+    .into())
+}
+
+fn schema_for(input: &DeriveInput, sealed: bool) -> Result<TokenStream, syn::Error> {
     let name = &input.ident;
     let schema_name = format_ident!("__magic_map_schema_{}", name);
 
@@ -60,10 +154,11 @@ pub fn derive(input: DeriveInput) -> Result<TokenStream, syn::Error> {
                         .named
                         .iter()
                         .any(|f| f.attrs.iter().any(|a| a.path().is_ident("validate")));
-                let kind = if validated {
-                    quote! { vstruct }
-                } else {
-                    quote! { struct }
+                let kind = match (validated, sealed) {
+                    (true, true) => quote! { svstruct },
+                    (true, false) => quote! { vstruct },
+                    (false, true) => quote! { sstruct },
+                    (false, false) => quote! { struct },
                 };
                 quote! { @#kind [ #(#fields),* ] }
             }
@@ -130,6 +225,7 @@ pub fn derive(input: DeriveInput) -> Result<TokenStream, syn::Error> {
 // ── 2. magic_map! — the call-site front end ──────────────────────────────────
 
 pub struct MagicMapInput {
+    infallible: bool,
     func: Option<(syn::Visibility, Ident)>,
     src: syn::Type,
     dest: Path,
@@ -138,6 +234,12 @@ pub struct MagicMapInput {
 
 impl Parse for MagicMapInput {
     fn parse(input: ParseStream) -> syn::Result<Self> {
+        // `infallible` is a contextual keyword, not a reserved one — peek for
+        // the ident rather than claiming the word for every caller.
+        let infallible = input.peek(Ident) && input.fork().parse::<Ident>()? == "infallible";
+        if infallible {
+            input.parse::<Ident>()?;
+        }
         let func = if input.peek(Token![pub]) || input.peek(Token![fn]) {
             let vis: syn::Visibility = input.parse()?;
             input.parse::<Token![fn]>()?;
@@ -151,10 +253,12 @@ impl Parse for MagicMapInput {
         match &src {
             syn::Type::Path(_) => {}
             syn::Type::Tuple(t) if !t.elems.is_empty() => {}
+            syn::Type::Reference(r) if matches!(&*r.elem, syn::Type::Path(_)) => {}
             _ => {
                 return Err(syn::Error::new_spanned(
                     &src,
-                    "magic_map! source must be a type path or a non-empty tuple of types",
+                    "magic_map! source must be a type path, a reference to one, \
+                     or a non-empty tuple of types",
                 ))
             }
         }
@@ -168,6 +272,7 @@ impl Parse for MagicMapInput {
             TokenStream2::new()
         };
         Ok(Self {
+            infallible,
             func,
             src,
             dest,
@@ -178,6 +283,7 @@ impl Parse for MagicMapInput {
 
 pub fn front(input: MagicMapInput) -> TokenStream {
     let MagicMapInput {
+        infallible,
         func,
         src,
         dest,
@@ -190,9 +296,11 @@ pub fn front(input: MagicMapInput) -> TokenStream {
     let last = schema.segments.last_mut().unwrap();
     last.ident = format_ident!("__magic_map_schema_{}", last.ident);
 
-    let mode = match func {
-        Some((vis, name)) => quote! { @fn(#vis #name) },
-        None => quote! { @impl },
+    let mode = match (func, infallible) {
+        (Some((vis, name)), false) => quote! { @fn(#vis #name) },
+        (Some((vis, name)), true) => quote! { @ifn(#vis #name) },
+        (None, false) => quote! { @impl },
+        (None, true) => quote! { @iimpl },
     };
 
     quote! {
@@ -215,6 +323,7 @@ pub fn front(input: MagicMapInput) -> TokenStream {
 //   @src(Type) @dest(Path) @overrides{ field: expr, .. }
 
 struct Shape {
+    sealed: bool,
     is_enum: bool,
     /// True when the destination struct's schema was emitted as `@vstruct`
     /// because some field carries `#[validate(...)]`.
@@ -233,13 +342,17 @@ fn parse_shape(input: ParseStream) -> syn::Result<Shape> {
         .collect();
     Ok(Shape {
         is_enum: kind == "enum",
-        // @vstruct signals "struct with #[validate(...)] fields"; plain @struct does not.
-        validated: kind == "vstruct",
+        // @vstruct signals "struct with #[validate(...)] fields"; @sstruct that the
+        // type is sealed, so it is built through its constructor rather than a
+        // struct expression. @svstruct is both.
+        sealed: kind == "sstruct" || kind == "svstruct",
+        validated: kind == "vstruct" || kind == "svstruct",
         names,
     })
 }
 
 pub struct ExpandInput {
+    infallible: bool,
     collected: Vec<(usize, Shape)>,
     dest_shape: Shape,
     func: Option<(syn::Visibility, Ident)>,
@@ -281,7 +394,8 @@ impl Parse for ExpandInput {
         // @impl | @fn(vis name)
         input.parse::<Token![@]>()?;
         let mode: Ident = input.call(Ident::parse_any)?;
-        let func = if mode == "fn" {
+        let infallible = mode == "ifn" || mode == "iimpl";
+        let func = if mode == "fn" || mode == "ifn" {
             let fn_content;
             syn::parenthesized!(fn_content in input);
             let vis: syn::Visibility = fn_content.parse()?;
@@ -352,6 +466,7 @@ impl Parse for ExpandInput {
         }
 
         Ok(Self {
+            infallible,
             collected,
             dest_shape,
             func,
@@ -408,6 +523,7 @@ enum FieldSource {
 
 pub fn expand(raw: TokenStream2, input: ExpandInput) -> Result<TokenStream, syn::Error> {
     let ExpandInput {
+        infallible,
         collected,
         dest_shape,
         func,
@@ -473,10 +589,27 @@ pub fn expand(raw: TokenStream2, input: ExpandInput) -> Result<TokenStream, syn:
     // the binder from a user-written token's span so they share context.
     let src_var = Ident::new("src", syn::spanned::Spanned::span(&src));
 
-    // The fn form is the foreign→foreign case: no `MapFrom` impl exists for
+    // The fn form is the foreign→foreign case: no `TryMapFrom` impl exists for
     // this pair, so its fields resolve through the crate-local funnel that
     // `magic_map_scope!` plants. The impl form keeps funnelling through
-    // `MapFrom` and needs no scope.
+    // `TryMapFrom` and needs no scope.
+    // `..Default::default()` funnels through MapPair, and #[validate] returns a
+    // Result: neither can be infallible. Say so here rather than let the user
+    // read a type error from inside the expansion.
+    if infallible && defaults {
+        return Err(syn::Error::new_spanned(
+            &dest,
+            "an infallible mapping cannot use `..Default::default()` — the default \
+             funnel is fallible; drop `infallible` or the trailer",
+        ));
+    }
+    if infallible && dest_shape.validated {
+        return Err(syn::Error::new_spanned(
+            &dest,
+            "an infallible mapping cannot target a type with #[validate(...)] fields — \
+             validation returns a Result; drop `infallible`",
+        ));
+    }
     let local = func.is_some();
 
     let body = if dest_shape.is_enum {
@@ -570,11 +703,11 @@ pub fn expand(raw: TokenStream2, input: ExpandInput) -> Result<TokenStream, syn:
             ));
         }
 
-        let mut assigns = Vec::new();
+        let mut assigns: Vec<(Ident, TokenStream2)> = Vec::new();
         let mut defaulted = false;
         for f in &dest_shape.names {
             if let Some((_, expr)) = overrides.iter().find(|(name, _)| name == f) {
-                assigns.push(quote! { #f: #expr });
+                assigns.push((f.clone(), quote! { #expr }));
                 continue;
             }
             let source = if tuple_elems.is_none() {
@@ -636,11 +769,11 @@ pub fn expand(raw: TokenStream2, input: ExpandInput) -> Result<TokenStream, syn:
                 // their inner value (None → default instance's field); plain
                 // funnel next (Option→Option stays None→None); plain source
                 // into an `Option` dest wraps in `Some`.
-                // The fn form has no `MapFrom` impl to funnel through, so it
+                // The fn form has no `TryMapFrom` impl to funnel through, so it
                 // reads the crate-local trait `magic_map_scope!` planted —
                 // same three autoref tiers, local names.
                 // The fn form funnels through the crate-local trait, which
-                // has no `MapFrom` impl for a foreign→foreign pair to reach.
+                // has no `TryMapFrom` impl for a foreign→foreign pair to reach.
                 // Same three autoref tiers, local names.
                 let (opt, val, wrap, probe) = if local {
                     (
@@ -657,7 +790,7 @@ pub fn expand(raw: TokenStream2, input: ExpandInput) -> Result<TokenStream, syn:
                         quote! { map_field_or },
                     )
                 };
-                assigns.push(quote! { #f: {
+                assigns.push((f.clone(), quote! { {
                     use #opt;
                     use #val;
                     use #wrap;
@@ -666,32 +799,107 @@ pub fn expand(raw: TokenStream2, input: ExpandInput) -> Result<TokenStream, syn:
                         ::core::option::Option::Some(__magic_fb.#f),
                     ))
                         .#probe()?
-                } });
+                } }));
+            } else if infallible {
+                // Always the global funnel, never the crate-local one: the
+                // local funnel is fallible by construction. A field pair with
+                // only a TryMapFrom route fails to resolve here, which is the
+                // whole check — `infallible` cannot be claimed wrongly.
+                assigns.push((f.clone(), quote! { ::magic_map::MapFrom::map_from(#access) }));
             } else if local {
-                assigns.push(quote! {
-                    #f: crate::__magic_map_scope::LocalMapFrom::local_map_from(#access)?
-                });
+                assigns.push((
+                    f.clone(),
+                    quote! { crate::__magic_map_scope::LocalMapFrom::local_map_from(#access)? },
+                ));
             } else {
-                assigns.push(quote! { #f: ::magic_map::MapFrom::map_from(#access)? });
+                assigns.push((f.clone(), quote! { ::magic_map::TryMapFrom::try_map_from(#access)? }));
             }
         }
+        let trailer = defaulted.then(|| quote! { ..::core::default::Default::default() });
+        // How the destination gets built. A sealed type has no struct
+        // expression available to another crate, so it goes through its
+        // constructor — positionally, in declaration order, which is the order
+        // this loop walked. When fields were left to Default there is no
+        // all-fields call to make, so it starts from the default instance and
+        // assigns: `#[non_exhaustive]` blocks construction and exhaustive
+        // patterns, never field assignment.
+        let fields: Vec<&Ident> = assigns.iter().map(|(f, _)| f).collect();
+        let values: Vec<&TokenStream2> = assigns.iter().map(|(_, v)| v).collect();
+        let build = if dest_shape.sealed {
+            if defaulted || defaults {
+                quote! {{
+                    let mut __magic_seal = <#dest as ::core::default::Default>::default();
+                    #( __magic_seal.#fields = #values; )*
+                    __magic_seal
+                }}
+            } else {
+                quote! { #dest::__magic_map_new_unchecked(#(#values),*) }
+            }
+        } else {
+            quote! { #dest { #(#fields: #values,)* #trailer } }
+        };
+
         let prelude = defaults.then(|| {
             quote! { let __magic_fb = <#dest as ::core::default::Default>::default(); }
         });
-        let trailer = defaulted.then(|| quote! { ..::core::default::Default::default() });
         if dest_shape.validated {
             quote! {
                 #prelude
                 #(#lets)*
-                let __magic_result = #dest { #(#assigns,)* #trailer };
+                let __magic_result = #build;
                 ::magic_map::validator::Validate::validate(&__magic_result)
                     .map_err(::magic_map::MappingError::Validation)?;
                 ::core::result::Result::Ok(__magic_result)
             }
+        } else if infallible {
+            quote! { #prelude #(#lets)* #build }
         } else {
-            quote! { #prelude #(#lets)* ::core::result::Result::Ok(#dest { #(#assigns,)* #trailer }) }
+            quote! { #prelude #(#lets)* ::core::result::Result::Ok(#build) }
         }
     };
+
+    if infallible {
+        return Ok(match func {
+            Some((vis, name)) => quote! {
+                #vis fn #name(#src_var: #src) -> #dest {
+                    #body
+                }
+
+                // Registered in the crate-local fallible funnel too, wrapping in
+                // Ok: a fallible mapping nesting this type still auto-fills.
+                impl crate::__magic_map_scope::LocalMapFrom<#src> for #dest {
+                    fn local_map_from(
+                        src: #src,
+                    ) -> ::core::result::Result<Self, ::magic_map::MappingError> {
+                        ::core::result::Result::Ok(#name(src))
+                    }
+                }
+            },
+            None => quote! {
+                impl ::magic_map::MapFrom<#src> for #dest {
+                    fn map_from(#src_var: #src) -> Self {
+                        #body
+                    }
+                }
+
+                // The fallible half comes free, so an infallible mapping is
+                // usable from `try_map_into()` without the caller knowing.
+                // Written out rather than blanket-impl'd: a blanket
+                // `impl<S, D: MapFrom<S>> TryMapFrom<S> for D` overlaps every
+                // generated TryMapFrom impl and coherence rejects it.
+                impl ::magic_map::TryMapFrom<#src> for #dest {
+                    fn try_map_from(
+                        src: #src,
+                    ) -> ::core::result::Result<Self, ::magic_map::MappingError> {
+                        ::core::result::Result::Ok(
+                            <Self as ::magic_map::MapFrom<#src>>::map_from(src),
+                        )
+                    }
+                }
+            },
+        }
+        .into());
+    }
 
     Ok(match func {
         Some((vis, name)) => quote! {
@@ -705,7 +913,7 @@ pub fn expand(raw: TokenStream2, input: ExpandInput) -> Result<TokenStream, syn:
             // fn-form mapping can auto-fill a nested field of this type. The
             // orphan rule permits it because the trait is local even when both
             // types are foreign, and the impls are concrete so they never
-            // shadow a leaf's route to `MapFrom`.
+            // shadow a leaf's route to `TryMapFrom`.
             impl crate::__magic_map_scope::LocalMapFrom<#src> for #dest {
                 fn local_map_from(
                     src: #src,
@@ -715,8 +923,8 @@ pub fn expand(raw: TokenStream2, input: ExpandInput) -> Result<TokenStream, syn:
             }
         },
         None => quote! {
-            impl ::magic_map::MapFrom<#src> for #dest {
-                fn map_from(
+            impl ::magic_map::TryMapFrom<#src> for #dest {
+                fn try_map_from(
                     #src_var: #src,
                 ) -> ::core::result::Result<Self, ::magic_map::MappingError> {
                     #body
@@ -852,7 +1060,7 @@ pub fn leaves(input: LeavesInput) -> Result<TokenStream, syn::Error> {
                 fn local_map_from(
                     src: #src,
                 ) -> ::core::result::Result<Self, ::magic_map::MappingError> {
-                    <#dest as ::magic_map::MapFrom<#src>>::map_from(src)
+                    <#dest as ::magic_map::TryMapFrom<#src>>::try_map_from(src)
                 }
             }
         }

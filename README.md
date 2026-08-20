@@ -5,7 +5,7 @@ types you **don't own** (DB rows, prost-generated protos, OpenAPI DTOs) with
 strict, compile-checked conversions.
 
 ```rust
-use magic_map::{magic_map, MapInto};
+use magic_map::{magic_map, TryMapInto};
 
 // The mapping is a standalone declaration — not an attribute on the type.
 magic_map!(db::Cat => api::CatDto {
@@ -17,7 +17,7 @@ magic_map!(db::Cat => api::CatDto {
 // nested mapped enums/structs… and a typo'd or newly-added field is a
 // COMPILE error, not a silently-unmapped field.
 
-let dto: api::CatDto = cat.map_into()?;
+let dto: api::CatDto = cat.try_map_into()?;
 ```
 
 ## Why another mapper?
@@ -112,7 +112,7 @@ mod mappers {
     magic_map!(super::db::Cat => super::api::CatDto);
 }
 
-use magic_map::MapInto;
+use magic_map::TryMapInto;
 
 let dto: api::CatDto = db::Cat {
     id: uuid::Uuid::nil(),
@@ -120,7 +120,7 @@ let dto: api::CatDto = db::Cat {
     age: 3,
     born: "2024-01-15T10:30:00Z".parse().unwrap(),
 }
-.map_into()?;
+.try_map_into()?;
 
 assert_eq!(dto.id, "00000000-0000-0000-0000-000000000000");
 assert_eq!(dto.name, "Misifu");
@@ -140,7 +140,7 @@ so what the README claims is what CI compiles and runs.
 
 ### impl form
 
-Generates `impl MapFrom<Src> for Dest`. Legal when your crate owns `Src` or
+Generates `impl TryMapFrom<Src> for Dest`. Legal when your crate owns `Src` or
 `Dest` (the usual db→dto / dto→db case). Override a field when it is absent
 from the source or needs an expression; everything else automaps:
 
@@ -166,7 +166,7 @@ magic_map!(db::Dog => api::DogDto {
     big: src.weight_kg > 30.0,
 });
 
-let dto: api::DogDto = db::Dog { name: "Rex".into(), weight_kg: 38.5 }.map_into()?;
+let dto: api::DogDto = db::Dog { name: "Rex".into(), weight_kg: 38.5 }.try_map_into()?;
 assert_eq!(dto.name, "Rex");
 assert!(dto.big);
 ```
@@ -232,8 +232,8 @@ at the crate root (`lib.rs`, `main.rs`, or the top of an integration test —
 integration tests are their own crate). Crates whose mappings are all impl
 form never call it.
 
-**Why it exists.** A mapping's *fields* funnel through `MapFrom` too. That is
-fine for the impl form, which leaves a `MapFrom` impl behind for the next
+**Why it exists.** A mapping's *fields* funnel through `TryMapFrom` too. That is
+fine for the impl form, which leaves a `TryMapFrom` impl behind for the next
 mapping to find. The fn form leaves none — so before this existed, a nested
 field whose own mapping was also foreign→foreign had nothing to resolve
 against, and you hand-wrote the recursion:
@@ -299,7 +299,7 @@ side. Write your own types as `crate::…` — those paths are republished as
 else (`String`, `::chrono::DateTime<..>`) passes through verbatim.
 
 For a one-off pair whose crate has no block, `leaves:` takes it inline — a bare
-type is its identity, `Src => Dest` one direction. A wrapper whose own `MapFrom`
+type is its identity, `Src => Dest` one direction. A wrapper whose own `TryMapFrom`
 impl is generic goes in `generic_leaves`, `;`-separated so the `where` clause's
 commas stay unambiguous:
 
@@ -308,7 +308,7 @@ magic_map::magic_map_scope! {
     from: [my_db],
     leaves: [Celsius, Celsius => String],
     generic_leaves: {
-        <S, D> Patch<S> => Patch<D> where D: ::magic_map::MapFrom<S>;
+        <S, D> Patch<S> => Patch<D> where D: ::magic_map::TryMapFrom<S>;
     },
 }
 ```
@@ -320,7 +320,7 @@ types: ``the trait bound `String: LocalMapFrom<Celsius>` is not satisfied``.
 
 Two shortcuts look obvious and neither is available.
 
-A blanket bridge forwarding every existing `MapFrom` into the local trait
+A blanket bridge forwarding every existing `TryMapFrom` into the local trait
 overlaps the per-pair impls, and coherence cannot rule the overlap out because
 either upstream crate could add the conflicting impl later:
 
@@ -328,10 +328,10 @@ either upstream crate could add the conflicting impl later:
 error[E0119]: conflicting implementations of trait `LocalMapFrom<Address>`
               for type `AddressResponse`
    = note: upstream crates may add a new impl of trait
-           `MapFrom<Address>` for type `AddressResponse` in future versions
+           `TryMapFrom<Address>` for type `AddressResponse` in future versions
 ```
 
-Nor can a second, `MapFrom`-backed tier sit underneath to catch leaves.
+Nor can a second, `TryMapFrom`-backed tier sit underneath to catch leaves.
 Autoref tiering needs the tiers told apart by receiver *shape*, as
 `MapFieldOpt`/`MapFieldVal`/`MapFieldWrap` are; a tier separated only by a
 where-bound hard-errors rather than falling through. And a concrete per-pair
@@ -376,7 +376,7 @@ assert_eq!(stats.midpoint, 15);
 
 ### Tuple sources
 
-`impl MapFrom<(A, B, ...)> for Dest` — call sites do `(a, b).map_into()?`.
+`impl TryMapFrom<(A, B, ...)> for Dest` — call sites do `(a, b).try_map_into()?`.
 Plain non-generic struct elements are **open**: they must derive `MagicMap`
 and their fields join the auto-match. Generic types, references and
 primitives are **opaque**: reachable only as `src.N` in overrides.
@@ -419,7 +419,7 @@ let card: api::AdoptionCard = (
     db::Owner { id: 99, name: "Ricardo".into() },
     Some("indoor only".to_string()),
 )
-    .map_into()?;
+    .try_map_into()?;
 
 assert_eq!(card.id, 99);       // picked from Owner
 assert_eq!(card.name, "Misifu"); // picked from Cat
@@ -521,7 +521,7 @@ let row: db::CreateCat = api::CreateCatRequest {
     lives: None,
     note: None,
 }
-.map_into()?;
+.try_map_into()?;
 
 assert_eq!(row.name, "Misifu"); // plain funnel
 assert_eq!(row.lives, 9);       // None → business default from the model
@@ -559,7 +559,7 @@ let patch: seen::CatPatch = seen::CatSeen {
     chip_id: "67e55044-10b1-426f-9247-bb680e5fe0c8".into(),
     weight_kg: 4.2,
 }
-.map_into()?;
+.try_map_into()?;
 assert!(patch.chip_id.is_some());
 
 // Still strict: a bad chip_id is an Err — never Some(Uuid::nil()).
@@ -567,7 +567,7 @@ let bad: Result<seen::CatPatch, _> = seen::CatSeen {
     chip_id: "not-a-uuid".into(),
     weight_kg: 4.2,
 }
-.map_into();
+.try_map_into();
 assert!(bad.is_err());
 ```
 
@@ -620,7 +620,7 @@ let user: db::NewUser = api::CreateUserRequest {
     email: "alice@example.com".into(),
     age: 30,
 }
-.map_into()?;
+.try_map_into()?;
 
 // Invalid input → Err(MappingError::Validation(...))
 let bad: Result<db::NewUser, _> = api::CreateUserRequest {
@@ -628,7 +628,7 @@ let bad: Result<db::NewUser, _> = api::CreateUserRequest {
     email: "not-an-email".into(),
     age: 30,
 }
-.map_into();
+.try_map_into();
 assert!(matches!(bad, Err(magic_map::MappingError::Validation(_))));
 ```
 
@@ -654,7 +654,7 @@ ever called.
 
 ## Leaves
 
-A *leaf* is a `MapFrom` impl for a known type pair. Identities for primitives
+A *leaf* is a `TryMapFrom` impl for a known type pair. Identities for primitives
 and `String` ship always; third-party leaves are feature-gated:
 
 | feature    | leaves / behavior |
@@ -688,8 +688,8 @@ magic_map::map_display!(Species);  // Species → String fields automap
 magic_map::map_parse!(Species);    // String → Species fields automap, strictly
 
 // Or hand-write any pair:
-impl magic_map::MapFrom<MyWireTimestamp> for chrono::DateTime<chrono::Utc> {
-    fn map_from(src: MyWireTimestamp) -> Result<Self, magic_map::MappingError> {
+impl magic_map::TryMapFrom<MyWireTimestamp> for chrono::DateTime<chrono::Utc> {
+    fn try_map_from(src: MyWireTimestamp) -> Result<Self, magic_map::MappingError> {
         /* strict conversion */
     }
 }
@@ -736,7 +736,7 @@ decision for the handler that owns the batch, not for the conversion.
   are not supported as destinations.
 - The fn form needs [`magic_map_scope!`](#magic_map_scope--the-fn-forms-crate-local-funnel)
   in the crate root, naming the crates whose leaves it uses. Coherence allows no
-  automatic bridge from `MapFrom` — see that section for the compiler's own
+  automatic bridge from `TryMapFrom` — see that section for the compiler's own
   reasoning — so leaves are delegated in, and `magic_map_leaves!` keeps that from
   becoming per-consumer bookkeeping.
 
