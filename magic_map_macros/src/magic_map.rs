@@ -806,16 +806,25 @@ pub fn expand(raw: TokenStream2, input: ExpandInput) -> Result<TokenStream, syn:
                     ))
                         .#probe()?
                 } }));
+            } else if infallible && local {
+                // The fn form funnels through the crate-local *infallible*
+                // trait, which only infallible fn-form mappings and infallible
+                // leaves are delegated into. A field pair with only a fallible
+                // route fails to resolve here, which is the whole check —
+                // `infallible` cannot be claimed wrongly.
+                assigns.push((
+                    f.clone(),
+                    quote! { crate::__magic_map_scope::LocalMapFrom::local_map_from(#access) },
+                ));
             } else if infallible {
-                // Always the global funnel, never the crate-local one: the
-                // local funnel is fallible by construction. A field pair with
-                // only a TryMapFrom route fails to resolve here, which is the
-                // whole check — `infallible` cannot be claimed wrongly.
+                // Same check through the global infallible funnel.
                 assigns.push((f.clone(), quote! { ::magic_map::MapFrom::map_from(#access) }));
             } else if local {
                 assigns.push((
                     f.clone(),
-                    quote! { crate::__magic_map_scope::LocalMapFrom::local_map_from(#access)? },
+                    quote! {
+                        crate::__magic_map_scope::LocalTryMapFrom::local_try_map_from(#access)?
+                    },
                 ));
             } else {
                 assigns.push((f.clone(), quote! { ::magic_map::TryMapFrom::try_map_from(#access)? }));
@@ -871,10 +880,18 @@ pub fn expand(raw: TokenStream2, input: ExpandInput) -> Result<TokenStream, syn:
                     #body
                 }
 
-                // Registered in the crate-local fallible funnel too, wrapping in
-                // Ok: a fallible mapping nesting this type still auto-fills.
+                // Registered in the crate-local infallible funnel, so another
+                // infallible fn-form mapping can nest this pair without a `?`.
                 impl crate::__magic_map_scope::LocalMapFrom<#src> for #dest {
-                    fn local_map_from(
+                    fn local_map_from(src: #src) -> Self {
+                        #name(src)
+                    }
+                }
+
+                // And in the fallible one, wrapping in Ok: a fallible mapping
+                // nesting this type still auto-fills.
+                impl crate::__magic_map_scope::LocalTryMapFrom<#src> for #dest {
+                    fn local_try_map_from(
                         src: #src,
                     ) -> ::core::result::Result<Self, ::magic_map::MappingError> {
                         ::core::result::Result::Ok(#name(src))
@@ -920,8 +937,8 @@ pub fn expand(raw: TokenStream2, input: ExpandInput) -> Result<TokenStream, syn:
             // orphan rule permits it because the trait is local even when both
             // types are foreign, and the impls are concrete so they never
             // shadow a leaf's route to `TryMapFrom`.
-            impl crate::__magic_map_scope::LocalMapFrom<#src> for #dest {
-                fn local_map_from(
+            impl crate::__magic_map_scope::LocalTryMapFrom<#src> for #dest {
+                fn local_try_map_from(
                     src: #src,
                 ) -> ::core::result::Result<Self, ::magic_map::MappingError> {
                     #name(src)
@@ -958,7 +975,7 @@ pub struct LeavesInput {
     identity: Vec<syn::Path>,
     display: Vec<syn::Path>,
     parse: Vec<syn::Path>,
-    custom: Vec<(syn::Type, syn::Type)>,
+    custom: Vec<(syn::Type, syn::Type, bool)>,
 }
 
 impl Parse for LeavesInput {
@@ -982,10 +999,17 @@ impl Parse for LeavesInput {
                 }
                 "custom" => {
                     while !content.is_empty() {
+                        // `infallible` marks a pair that carries a `MapFrom`
+                        // route; contextual keyword, same as in `magic_map!`.
+                        let infallible = content.peek(Ident)
+                            && content.fork().parse::<Ident>()? == "infallible";
+                        if infallible {
+                            content.parse::<Ident>()?;
+                        }
                         let src: syn::Type = content.parse()?;
                         content.parse::<Token![=>]>()?;
                         let dest: syn::Type = content.parse()?;
-                        custom.push((src, dest));
+                        custom.push((src, dest, infallible));
                         if content.peek(Token![,]) {
                             content.parse::<Token![,]>()?;
                         }
@@ -1044,29 +1068,63 @@ pub fn leaves(input: LeavesInput) -> Result<TokenStream, syn::Error> {
     };
 
     // The published list is expanded in *another* crate, so own-crate paths
-    // have to travel as `$crate::`.
-    let mut pairs: Vec<(TokenStream2, TokenStream2)> = Vec::new();
+    // have to travel as `$crate::`. Identities and Display routes are
+    // infallible by definition; `parse` is fallible; `custom` says which.
+    let mut pairs: Vec<(TokenStream2, TokenStream2, bool)> = Vec::new();
     for p in &identity {
         let t = republish(quote! { #p });
-        pairs.push((t.clone(), t));
+        pairs.push((t.clone(), t, true));
     }
     for p in &display {
-        pairs.push((republish(quote! { #p }), quote! { ::std::string::String }));
+        pairs.push((
+            republish(quote! { #p }),
+            quote! { ::std::string::String },
+            true,
+        ));
     }
     for p in &parse {
-        pairs.push((quote! { ::std::string::String }, republish(quote! { #p })));
+        pairs.push((
+            quote! { ::std::string::String },
+            republish(quote! { #p }),
+            false,
+        ));
     }
-    for (src, dest) in &custom {
-        pairs.push((republish(quote! { #src }), republish(quote! { #dest })));
+    for (src, dest, infallible) in &custom {
+        pairs.push((
+            republish(quote! { #src }),
+            republish(quote! { #dest }),
+            *infallible,
+        ));
     }
 
-    let replays = pairs.iter().map(|(src, dest)| {
-        quote! {
-            impl LocalMapFrom<#src> for #dest {
-                fn local_map_from(
-                    src: #src,
-                ) -> ::core::result::Result<Self, ::magic_map::MappingError> {
-                    <#dest as ::magic_map::TryMapFrom<#src>>::try_map_from(src)
+    // An infallible pair backs BOTH local funnels with its one `MapFrom`
+    // route, so the owning crate never writes the Ok-wrap twin by hand.
+    let replays = pairs.iter().map(|(src, dest, infallible)| {
+        if *infallible {
+            quote! {
+                impl LocalMapFrom<#src> for #dest {
+                    fn local_map_from(src: #src) -> Self {
+                        <#dest as ::magic_map::MapFrom<#src>>::map_from(src)
+                    }
+                }
+                impl LocalTryMapFrom<#src> for #dest {
+                    fn local_try_map_from(
+                        src: #src,
+                    ) -> ::core::result::Result<Self, ::magic_map::MappingError> {
+                        ::core::result::Result::Ok(
+                            <#dest as ::magic_map::MapFrom<#src>>::map_from(src),
+                        )
+                    }
+                }
+            }
+        } else {
+            quote! {
+                impl LocalTryMapFrom<#src> for #dest {
+                    fn local_try_map_from(
+                        src: #src,
+                    ) -> ::core::result::Result<Self, ::magic_map::MappingError> {
+                        <#dest as ::magic_map::TryMapFrom<#src>>::try_map_from(src)
+                    }
                 }
             }
         }

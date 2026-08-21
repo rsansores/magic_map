@@ -6,7 +6,10 @@ magic_map::magic_map_leaves! {
     identity: [crate::enums::Species],
     display: [crate::enums::Species],
     parse: [crate::enums::Species],
-    custom: [crate::wire::Fahrenheit => String],
+    custom: [
+        crate::wire::Fahrenheit => String,
+        infallible crate::wire::Celsius => String,
+    ],
 }
 
 pub mod enums {
@@ -28,6 +31,17 @@ pub mod wire {
     impl magic_map::TryMapFrom<Fahrenheit> for String {
         fn try_map_from(src: Fahrenheit) -> Result<Self, magic_map::MappingError> {
             Ok(format!("{}F", src.0))
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub struct Celsius(pub i32);
+
+    // An infallible custom leaf carries one `MapFrom` impl; the `infallible`
+    // entry in the block above backs both local funnels with it.
+    impl magic_map::MapFrom<Celsius> for String {
+        fn map_from(src: Celsius) -> Self {
+            format!("{}C", src.0)
         }
     }
 }
