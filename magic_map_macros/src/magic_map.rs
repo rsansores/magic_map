@@ -31,7 +31,7 @@ use syn::{Data, DeriveInput, Fields, Ident, Path, Token};
 // ── 1. #[derive(MagicMap)] — metadata only ───────────────────────────────────
 
 pub fn derive(input: DeriveInput) -> Result<TokenStream, syn::Error> {
-    schema_for(&input, false)
+    schema_for(&input, false, None)
 }
 
 /// `#[mapped]` / `#[mapped(sealed)]` — the attribute form.
@@ -54,13 +54,15 @@ pub fn derive(input: DeriveInput) -> Result<TokenStream, syn::Error> {
 /// an accusation in review.
 pub fn mapped(attr: TokenStream2, item: TokenStream2) -> Result<TokenStream, syn::Error> {
     let mut sealed = false;
+    let mut export = None;
     if !attr.is_empty() {
         let parser = syn::meta::parser(|meta| {
             if meta.path.is_ident("sealed") {
                 sealed = true;
                 Ok(())
             } else if meta.path.is_ident("export") {
-                let _: syn::LitStr = meta.value()?.parse()?;
+                let v: syn::LitStr = meta.value()?.parse()?;
+                export = Some(v.value());
                 Ok(())
             } else {
                 Err(meta.error("expected `sealed` or `export = \"UniqueName\"`"))
@@ -69,8 +71,25 @@ pub fn mapped(attr: TokenStream2, item: TokenStream2) -> Result<TokenStream, syn
         syn::parse::Parser::parse2(parser, attr.clone())?;
     }
 
-    let input: DeriveInput = syn::parse2(item)?;
-    let schema: TokenStream2 = schema_for(&input, sealed)?.into();
+    // The helper attribute (`#[magic_map(export = ..)]`) is legal next to the
+    // derive but has no owner once the attribute form re-emits the item, so
+    // read it into the override and strip it.
+    let mut input: DeriveInput = syn::parse2(item)?;
+    for attr in &input.attrs {
+        if attr.path().is_ident("magic_map") {
+            attr.parse_nested_meta(|meta| {
+                if meta.path.is_ident("export") {
+                    let v: syn::LitStr = meta.value()?.parse()?;
+                    export = Some(v.value());
+                    Ok(())
+                } else {
+                    Err(meta.error("expected `export = \"UniqueName\"`"))
+                }
+            })?;
+        }
+    }
+    input.attrs.retain(|a| !a.path().is_ident("magic_map"));
+    let schema: TokenStream2 = schema_for(&input, sealed, export)?.into();
 
     let named = match &input.data {
         Data::Struct(d) => match &d.fields {
@@ -124,7 +143,11 @@ pub fn mapped(attr: TokenStream2, item: TokenStream2) -> Result<TokenStream, syn
     .into())
 }
 
-fn schema_for(input: &DeriveInput, sealed: bool) -> Result<TokenStream, syn::Error> {
+fn schema_for(
+    input: &DeriveInput,
+    sealed: bool,
+    export: Option<String>,
+) -> Result<TokenStream, syn::Error> {
     let name = &input.ident;
     let schema_name = format_ident!("__magic_map_schema_{}", name);
 
@@ -178,7 +201,7 @@ fn schema_for(input: &DeriveInput, sealed: bool) -> Result<TokenStream, syn::Err
     // export name — needed when two same-named types live in one crate (e.g.
     // a proto crate with `g4s.Sale` and `models.Sale`). The module-scoped
     // alias that magic_map! resolves keeps the real type name either way.
-    let mut export_override: Option<String> = None;
+    let mut export_override: Option<String> = export;
     for attr in &input.attrs {
         if attr.path().is_ident("magic_map") {
             attr.parse_nested_meta(|meta| {
