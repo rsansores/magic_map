@@ -153,6 +153,30 @@ let scope = tenant.map_into();   // was: tenant.into(), or try_map_into()?
 If it does not compile, the mapping was not infallible and the error names the
 field pair.
 
+Infallible fn-forms compose: `magic_map_scope!` plants an infallible local
+funnel beside the fallible one, so an `infallible fn` mapping nests another
+foreign→foreign `infallible fn` mapping the same way fallible ones always
+nested.
+
+**Mark your leaves.** `map_identity!` and `map_display!` now emit the
+`MapFrom` twin automatically (an identity or a `Display` cannot fail). A
+hand-written custom leaf that cannot fail writes one `MapFrom` impl and takes
+an `infallible` prefix in the `magic_map_leaves!` block — that one impl then
+backs both funnels, local and global:
+
+```rust
+magic_map::magic_map_leaves! {
+    identity: [crate::FileKind],
+    custom: [
+        infallible crate::TimeZone => String,  // impl MapFrom<TimeZone> for String
+        String => crate::TimeZone,             // parse: stays fallible
+    ],
+}
+```
+
+A pair left unmarked keeps working fallibly — marking is what lets it appear
+inside `infallible` mappings.
+
 ### 3. Seal, one owning crate at a time (optional)
 
 Replace the derive — the attribute must come **first**, since it rewrites the
@@ -178,3 +202,18 @@ declaring the mapping rather than by reaching for
 `__magic_map_new_unchecked` — which is public only because a macro expansion
 holds no privilege a hand-written line lacks, and which is named to be obvious
 in review.
+
+### 4. Lint the escape hatch shut (optional)
+
+Sealing cannot reach types local to the mapping crate, conversions *out of* a
+sealed type, or anything unsealed. `magic-map-lint` covers those: it walks a
+source tree and flags every `impl From / Into / TryFrom / TryInto`, which is
+the escape hatch that grows back. Error conversions (`impl From<MappingError>
+for ApiError` — either side's name ending in `Error`) are exempt, and an
+allowlist file holds the cases that are genuinely not mappings; a stale
+allowlist entry fails the run, so the list only shrinks.
+
+```sh
+cargo install magic_map_lint
+magic-map-lint --allow .magic-map-allow src/ crates/
+```
