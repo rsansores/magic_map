@@ -74,6 +74,28 @@ fn reference_source_maps_without_moving() {
     assert_eq!(s.name, "borrowed"); // still ours
 }
 
+// ── enums: variant-to-variant over unit enums cannot fail ────────────────────
+#[derive(MagicMap, Debug, PartialEq)]
+pub enum WireKind {
+    Image,
+    Document,
+}
+#[derive(MagicMap, Debug, PartialEq)]
+pub enum DomainKind {
+    Image,
+    Document,
+}
+magic_map!(infallible WireKind => DomainKind);
+
+#[test]
+fn infallible_enum_form_needs_no_question_mark() {
+    let d: DomainKind = WireKind::Document.map_into();
+    assert_eq!(d, DomainKind::Document);
+    // and the fallible half still comes free
+    let d: DomainKind = WireKind::Image.try_map_into().expect("cannot fail");
+    assert_eq!(d, DomainKind::Image);
+}
+
 // ── the claim is not on the honour system ────────────────────────────────────
 // String -> Uuid parses, so it has a TryMapFrom route and no MapFrom one.
 // Uncommenting this must not compile.

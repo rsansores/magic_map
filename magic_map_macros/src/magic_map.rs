@@ -683,7 +683,13 @@ pub fn expand(raw: TokenStream2, input: ExpandInput) -> Result<TokenStream, syn:
                 ));
             }
         }
-        quote! { ::core::result::Result::Ok(match #src_var { #(#arms),* }) }
+        // Variant-to-variant over unit enums cannot fail, so the match itself
+        // is the infallible body; the fallible signature wraps it in Ok.
+        if infallible {
+            quote! { match #src_var { #(#arms),* } }
+        } else {
+            quote! { ::core::result::Result::Ok(match #src_var { #(#arms),* }) }
+        }
     } else {
         if let Some((bad, _)) = variant_renames.first() {
             return Err(syn::Error::new(
