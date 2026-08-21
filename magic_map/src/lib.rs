@@ -87,6 +87,21 @@ pub use magic_map_macros::{magic_map, magic_map_leaves, MagicMap, mapped};
 #[doc(hidden)]
 pub use magic_map_macros::__magic_map_expand;
 
+// The scope leaf groups name third-party leaf types through these, so a crate
+// calling `magic_map_scope!` does not need uuid/chrono/decimal/json as direct
+// dependencies just because this crate's features enable those leaves.
+#[doc(hidden)]
+pub mod __rx {
+    #[cfg(feature = "chrono")]
+    pub use chrono;
+    #[cfg(feature = "decimal")]
+    pub use rust_decimal;
+    #[cfg(feature = "json")]
+    pub use serde_json;
+    #[cfg(feature = "uuid")]
+    pub use uuid;
+}
+
 // Re-exported so generated code can reach the `Validate` trait as
 // `::magic_map::validator::Validate` without the call-site (or a neutral mapper
 // crate) needing a direct `validator` dependency, and so the `validator` version
@@ -899,9 +914,9 @@ macro_rules! __magic_map_scope_leaves {
 macro_rules! __magic_map_scope_uuid_leaves {
     () => {
         $crate::__magic_map_scope_extra_leaves!(
-            ::uuid::Uuid,
-            ::std::string::String => ::uuid::Uuid,
-            infallible ::uuid::Uuid => ::std::string::String,
+            $crate::__rx::uuid::Uuid,
+            ::std::string::String => $crate::__rx::uuid::Uuid,
+            infallible $crate::__rx::uuid::Uuid => ::std::string::String,
         );
     };
 }
@@ -918,11 +933,11 @@ macro_rules! __magic_map_scope_uuid_leaves {
 macro_rules! __magic_map_scope_decimal_leaves {
     () => {
         $crate::__magic_map_scope_extra_leaves!(
-            ::rust_decimal::Decimal,
-            ::rust_decimal::Decimal => f64,
-            f64 => ::rust_decimal::Decimal,
-            ::std::string::String => ::rust_decimal::Decimal,
-            infallible ::rust_decimal::Decimal => ::std::string::String,
+            $crate::__rx::rust_decimal::Decimal,
+            $crate::__rx::rust_decimal::Decimal => f64,
+            f64 => $crate::__rx::rust_decimal::Decimal,
+            ::std::string::String => $crate::__rx::rust_decimal::Decimal,
+            infallible $crate::__rx::rust_decimal::Decimal => ::std::string::String,
         );
     };
 }
@@ -939,14 +954,14 @@ macro_rules! __magic_map_scope_decimal_leaves {
 macro_rules! __magic_map_scope_chrono_leaves {
     () => {
         $crate::__magic_map_scope_extra_leaves!(
-            ::chrono::DateTime<::chrono::Utc>,
-            ::chrono::NaiveDate,
-            ::chrono::NaiveDateTime,
-            ::chrono::NaiveTime,
-            ::std::string::String => ::chrono::DateTime<::chrono::Utc>,
-            infallible ::chrono::DateTime<::chrono::Utc> => ::std::string::String,
-            ::std::string::String => ::chrono::NaiveDate,
-            infallible ::chrono::NaiveDate => ::std::string::String,
+            $crate::__rx::chrono::DateTime<$crate::__rx::chrono::Utc>,
+            $crate::__rx::chrono::NaiveDate,
+            $crate::__rx::chrono::NaiveDateTime,
+            $crate::__rx::chrono::NaiveTime,
+            ::std::string::String => $crate::__rx::chrono::DateTime<$crate::__rx::chrono::Utc>,
+            infallible $crate::__rx::chrono::DateTime<$crate::__rx::chrono::Utc> => ::std::string::String,
+            ::std::string::String => $crate::__rx::chrono::NaiveDate,
+            infallible $crate::__rx::chrono::NaiveDate => ::std::string::String,
         );
     };
 }
@@ -962,7 +977,7 @@ macro_rules! __magic_map_scope_chrono_leaves {
 #[macro_export]
 macro_rules! __magic_map_scope_json_leaves {
     () => {
-        $crate::__magic_map_scope_extra_leaves!(::serde_json::Value);
+        $crate::__magic_map_scope_extra_leaves!($crate::__rx::serde_json::Value);
     };
 }
 #[cfg(not(feature = "json"))]
