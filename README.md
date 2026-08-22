@@ -875,6 +875,11 @@ decision for the handler that owns the batch, not for the conversion.
   must be a direct dependency, not renamed.
 - Two same-named `MagicMap` types in one crate collide on the hidden
   crate-root export — rename one or use `#[magic_map(export = "...")]`.
+- A *type* re-exported at a crate root (`pub use context::TenantContext`)
+  does not carry its schema alias along — a destination path must go through
+  the defining module (`commons::context::TenantContext`) or a *module*
+  re-export, or the mapping fails with ``could not find
+  `__magic_map_schema_…` ``.
 - Destination types must have named fields (or unit variants); tuple structs
   are not supported as destinations.
 - The fn form needs [`magic_map_scope!`](#magic_map_scope--the-fn-forms-crate-local-funnel)
