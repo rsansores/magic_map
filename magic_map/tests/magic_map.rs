@@ -1046,6 +1046,12 @@ mod declared {
         pub reference: String,
         pub status: String,
     }
+
+    #[derive(Debug, Default, magic_map::MagicMap)]
+    pub struct VerbatimOrder {
+        pub reference: String,
+        pub status: String,
+    }
 }
 
 magic_map!(declared::NewOrderRequest => declared::NewOrder { ..DeclaredDefaults });
@@ -1084,10 +1090,26 @@ fn any_default_takes_whatever_default_gives() {
 //   });
 //
 //   magic_map!(declared::NewOrderRequest => declared::LooseOrder {
-//       reference: src.reference, // identity override — the automap does this
-//       ..AnyDefault
-//   });
-//
-//   magic_map!(declared::NewOrderRequest => declared::LooseOrder {
 //       ..Default::default()      // removed in 0.5; say which defaults you mean
 //   });
+
+// `field: src.field` is NOT redundant and is not rejected. An override is
+// assigned verbatim; an automapped field goes through the funnel. They differ
+// whenever the funnel for that type is not the identity — and for a foreign
+// type the orphan rule can leave a caller no way to register one, so the
+// explicit override is the only spelling available.
+magic_map!(declared::NewOrderRequest => declared::VerbatimOrder {
+    reference: src.reference,
+    ..AnyDefault
+});
+
+#[test]
+fn identity_override_is_allowed_and_bypasses_the_funnel() {
+    let row: declared::VerbatimOrder = declared::NewOrderRequest {
+        reference: "ORD-3".into(),
+    }
+    .try_map_into()
+    .expect("verbatim override");
+    assert_eq!(row.reference, "ORD-3");
+    assert_eq!(row.status, ""); // untouched by the override, filled by AnyDefault
+}

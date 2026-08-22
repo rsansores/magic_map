@@ -879,19 +879,6 @@ pub fn expand(raw: TokenStream2, input: ExpandInput) -> Result<TokenStream, syn:
             ));
         }
 
-        // `field: src.field` is exactly what the automap emits, so the line
-        // only restates the default behaviour. If the source has the field it
-        // is redundant; if it does not, the expression would not compile —
-        // either way the override is wrong, and no whitelist can disagree.
-        for (f, expr) in &overrides {
-            if quote!(#expr).to_string().replace(' ', "") == format!("src.{f}") {
-                return Err(syn::Error::new_spanned(
-                    expr,
-                    format!("`{f}: src.{f}` is what the automap already does — delete the line"),
-                ));
-            }
-        }
-
         let mut assigns: Vec<(Ident, TokenStream2)> = Vec::new();
         let mut defaulted = false;
         let mut defaulted_fields: Vec<Ident> = Vec::new();

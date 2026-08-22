@@ -1,7 +1,7 @@
 # Migrating 0.4 → 0.5
 
-One removal and one new error. Both are mechanical, and both exist to stop the
-same thing: a mapping that compiles without anyone having decided what it means.
+One removal, mechanical, and it exists to stop one thing: a mapping that
+compiles without anyone having decided what its unmapped fields mean.
 
 ---
 
@@ -64,23 +64,6 @@ Leaving a mapping on `..AnyDefault` forever is a legitimate answer in exactly
 two cases — a **patch model**, whose contract already is "a field absent from
 the request is a column left untouched", and a **mapping still under
 construction**, where it is the honest marker rather than a silenced error.
-
----
-
-## `field: src.field` is now an error
-
-An override that restates the automap does nothing:
-
-```rust
-magic_map!(Src => Dest {
-    reference: src.reference,   // error: this is what the automap already does
-    ..AnyDefault
-});
-```
-
-If the source has the field, the line is redundant. If it does not, the
-expression would not have compiled. Either way it is wrong, so it is an error
-with no exception to configure. Delete the line.
 
 ---
 
