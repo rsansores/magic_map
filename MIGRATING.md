@@ -1,3 +1,89 @@
+# Migrating 0.4 → 0.5
+
+One removal and one new error. Both are mechanical, and both exist to stop the
+same thing: a mapping that compiles without anyone having decided what it means.
+
+---
+
+## `..Default::default()` is gone — say which defaults you mean
+
+The old trailer covered two unrelated situations with one spelling:
+
+- a destination field with a **real business default** (`created_at`, a status
+  that starts at `pending`), and
+- a field **nobody has mapped yet**, where `Default` is a placeholder standing
+  in for work that has not been done.
+
+Both compiled. Neither was distinguishable in review, and only the first one
+should survive a schema change: add a column and the old trailer silently
+absorbed it, which is exactly the guarantee a declaration-site mapper exists to
+provide.
+
+0.5 replaces it with two trailers:
+
+| trailer | a field may be omitted when… |
+|---|---|
+| *(none)* | never — every destination field must be mapped or overridden |
+| `..DeclaredDefaults` | the model declares its own `#[default(..)]` for it |
+| `..AnyDefault` | always — whatever `Default` gives is accepted |
+
+```rust
+// 0.4
+magic_map!(api::CreateCatRequest => db::CreateCat { ..Default::default() });
+
+// 0.5 — the model says what the unmapped fields mean
+magic_map!(api::CreateCatRequest => db::CreateCat { ..DeclaredDefaults });
+```
+```rust
+#[derive(SmartDefault, magic_map::MagicMap)]
+pub struct CreateCat {
+    pub name: String,
+    #[default = "new"]        // ← what `..DeclaredDefaults` reads
+    pub status: String,
+}
+```
+
+`#[default(..)]` is read as a plain attribute, so any derive using that
+spelling works. magic_map takes no dependency on one.
+
+### Migrating
+
+The cheap path is two steps, and the first one is a `sed`:
+
+1. **`..Default::default()` → `..AnyDefault` everywhere.** Behaviour is
+   identical, so the build goes green immediately.
+2. **Promote to `..DeclaredDefaults` crate by crate.** Each one fails with the
+   fields it cannot account for, named. Map them, or give the model a
+   `#[default(..)]`, or leave that mapping on `..AnyDefault` and come back.
+
+Step 2 is worth doing per crate rather than all at once: the compiler's list is
+the inventory of every mapping nobody finished, and it is easier to act on a
+crate at a time.
+
+Leaving a mapping on `..AnyDefault` forever is a legitimate answer in exactly
+two cases — a **patch model**, whose contract already is "a field absent from
+the request is a column left untouched", and a **mapping still under
+construction**, where it is the honest marker rather than a silenced error.
+
+---
+
+## `field: src.field` is now an error
+
+An override that restates the automap does nothing:
+
+```rust
+magic_map!(Src => Dest {
+    reference: src.reference,   // error: this is what the automap already does
+    ..AnyDefault
+});
+```
+
+If the source has the field, the line is redundant. If it does not, the
+expression would not have compiled. Either way it is wrong, so it is an error
+with no exception to configure. Delete the line.
+
+---
+
 # Migrating 0.3 → 0.4
 
 One rename, three new capabilities. The rename is mechanical — a `sed` and a

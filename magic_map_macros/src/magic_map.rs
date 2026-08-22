@@ -234,6 +234,15 @@ fn schema_for(
                     .iter()
                     .map(|f| f.ident.as_ref().unwrap())
                     .collect();
+                // Fields carrying their own default (`smart_default`'s
+                // `#[default(..)]`) travel beside the names: they are the only
+                // ones `..DeclaredDefaults` lets a mapping leave unmapped.
+                let declared: Vec<_> = named
+                    .named
+                    .iter()
+                    .filter(|f| f.attrs.iter().any(|a| a.path().is_ident("default")))
+                    .map(|f| f.ident.as_ref().unwrap())
+                    .collect();
                 // Use @vstruct (instead of @struct) when any field carries
                 // #[validate(...)], so __magic_map_expand! knows to call
                 // validator::Validate::validate(&result)? after construction.
@@ -253,7 +262,7 @@ fn schema_for(
                     (false, true) => quote! { sstruct },
                     (false, false) => quote! { struct },
                 };
-                quote! { @#kind [ #(#fields),* ] }
+                quote! { @#kind [ #(#fields),* ] [ #(#declared),* ] }
             }
             _ => return Ok(TokenStream::new()),
         },
@@ -415,6 +424,30 @@ pub fn front(input: MagicMapInput) -> TokenStream {
 //   @impl | @fn(vis name)
 //   @src(Type) @dest(Path) @overrides{ field: expr, .. }
 
+/// Which fields a mapping may leave unmapped.
+///
+/// `..Default::default()` used to be the only trailer, and it conflated two
+/// unrelated things: a field with a real business default, and a field nobody
+/// got round to mapping. Splitting it makes the caller say which one they mean.
+#[derive(Clone, Copy, PartialEq)]
+enum Trailer {
+    /// No trailer: every destination field must be mapped or overridden.
+    None,
+    /// `..DeclaredDefaults` — a field may be omitted only if the model gives it
+    /// its own `#[default(..)]`. A new column without one is a compile error.
+    Declared,
+    /// `..AnyDefault` — anything left falls to `Default`. Correct for a patch
+    /// model, whose contract is "absent means untouched"; and the honest marker
+    /// for a mapping that is not finished.
+    Any,
+}
+
+impl Trailer {
+    fn present(self) -> bool {
+        self != Trailer::None
+    }
+}
+
 struct Shape {
     sealed: bool,
     is_enum: bool,
@@ -422,6 +455,25 @@ struct Shape {
     /// because some field carries `#[validate(...)]`.
     validated: bool,
     names: Vec<Ident>,
+    /// Fields carrying `#[default(..)]` on the model — what
+    /// `..DeclaredDefaults` permits a mapping to omit. Empty for enums.
+    declared: Vec<Ident>,
+}
+
+/// `a`, `a and b`, `a, b and c` — error messages name every field, because the
+/// list IS the work the caller has to do.
+fn plural(names: &[String]) -> String {
+    match names {
+        [one] => format!("`{one}`"),
+        [rest @ .., last] => format!(
+            "{} and `{last}`",
+            rest.iter()
+                .map(|n| format!("`{n}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        [] => String::new(),
+    }
 }
 
 fn parse_shape(input: ParseStream) -> syn::Result<Shape> {
@@ -433,6 +485,16 @@ fn parse_shape(input: ParseStream) -> syn::Result<Shape> {
     let names = Punctuated::<Ident, Token![,]>::parse_terminated(&names_content)?
         .into_iter()
         .collect();
+    // Structs carry a second list (possibly empty); enums emit none.
+    let declared = if input.peek(syn::token::Bracket) {
+        let declared_content;
+        syn::bracketed!(declared_content in input);
+        Punctuated::<Ident, Token![,]>::parse_terminated(&declared_content)?
+            .into_iter()
+            .collect()
+    } else {
+        Vec::new()
+    };
     Ok(Shape {
         is_enum: kind == "enum",
         // @vstruct signals "struct with #[validate(...)] fields"; @sstruct that the
@@ -441,6 +503,7 @@ fn parse_shape(input: ParseStream) -> syn::Result<Shape> {
         sealed: kind == "sstruct" || kind == "svstruct",
         validated: kind == "vstruct" || kind == "svstruct",
         names,
+        declared,
     })
 }
 
@@ -457,7 +520,7 @@ pub struct ExpandInput {
     lets: Vec<syn::Stmt>,
     /// Enum mappings: `SrcVariant => DestVariant` rename pairs.
     variant_renames: Vec<(Ident, Ident)>,
-    defaults: bool,
+    defaults: Trailer,
 }
 
 impl Parse for ExpandInput {
@@ -519,27 +582,41 @@ impl Parse for ExpandInput {
         let mut overrides = Vec::new();
         let mut lets = Vec::new();
         let mut variant_renames = Vec::new();
-        let mut defaults = false;
+        let mut defaults = Trailer::None;
         while !ov_content.is_empty() {
             if ov_content.peek(Token![let]) {
                 lets.push(ov_content.parse::<syn::Stmt>()?);
                 continue;
             }
-            // Trailing `..Default::default()`: dest fields absent from the
-            // source fall back to Default instead of erroring.
+            // Trailing `..DeclaredDefaults` / `..AnyDefault`: which dest
+            // fields absent from the source may fall back to Default.
             if ov_content.peek(Token![..]) {
                 ov_content.parse::<Token![..]>()?;
                 let expr: syn::Expr = ov_content.parse()?;
-                if quote!(#expr).to_string().replace(' ', "") != "Default::default()" {
-                    return Err(syn::Error::new_spanned(
-                        &expr,
-                        "only `..Default::default()` is supported here",
-                    ));
-                }
+                defaults = match quote!(#expr).to_string().replace(' ', "").as_str() {
+                    "DeclaredDefaults" => Trailer::Declared,
+                    "AnyDefault" => Trailer::Any,
+                    "Default::default()" => {
+                        return Err(syn::Error::new_spanned(
+                            &expr,
+                            "`..Default::default()` was removed in 0.5: say which \
+                             defaults you mean. `..DeclaredDefaults` lets a field be \
+                             omitted only if the model declares its own `#[default(..)]`; \
+                             `..AnyDefault` takes whatever `Default` gives — right for a \
+                             patch model, and the honest marker for a mapping you have \
+                             not finished",
+                        ))
+                    }
+                    _ => {
+                        return Err(syn::Error::new_spanned(
+                            &expr,
+                            "expected `..DeclaredDefaults` or `..AnyDefault`",
+                        ))
+                    }
+                };
                 if !ov_content.is_empty() {
-                    return Err(ov_content.error("`..Default::default()` must come last"));
+                    return Err(ov_content.error("the default trailer must come last"));
                 }
-                defaults = true;
                 break;
             }
             let field: Ident = ov_content.parse()?;
@@ -658,7 +735,7 @@ pub fn expand(raw: TokenStream2, input: ExpandInput) -> Result<TokenStream, syn:
                 let idx_lit = syn::Index::from(idx);
                 return Ok(quote! { #schema! { @for(#idx_lit) #raw } }.into());
             }
-        } else if (defaults || dest_shape.is_enum) && collected.is_empty() {
+        } else if (defaults.present() || dest_shape.is_enum) && collected.is_empty() {
             // `..Default::default()` on a single-path source: knowing which
             // dest fields the source CAN provide requires its schema too.
             // Enum destinations need the source's variant list for the same
@@ -689,10 +766,10 @@ pub fn expand(raw: TokenStream2, input: ExpandInput) -> Result<TokenStream, syn:
     // `..Default::default()` funnels through MapPair, and #[validate] returns a
     // Result: neither can be infallible. Say so here rather than let the user
     // read a type error from inside the expansion.
-    if infallible && defaults {
+    if infallible && defaults.present() {
         return Err(syn::Error::new_spanned(
             &dest,
-            "an infallible mapping cannot use `..Default::default()` — the default \
+            "an infallible mapping cannot use a default trailer — the default \
              funnel is fallible; drop `infallible` or the trailer",
         ));
     }
@@ -802,21 +879,36 @@ pub fn expand(raw: TokenStream2, input: ExpandInput) -> Result<TokenStream, syn:
             ));
         }
 
+        // `field: src.field` is exactly what the automap emits, so the line
+        // only restates the default behaviour. If the source has the field it
+        // is redundant; if it does not, the expression would not compile —
+        // either way the override is wrong, and no whitelist can disagree.
+        for (f, expr) in &overrides {
+            if quote!(#expr).to_string().replace(' ', "") == format!("src.{f}") {
+                return Err(syn::Error::new_spanned(
+                    expr,
+                    format!("`{f}: src.{f}` is what the automap already does — delete the line"),
+                ));
+            }
+        }
+
         let mut assigns: Vec<(Ident, TokenStream2)> = Vec::new();
         let mut defaulted = false;
+        let mut defaulted_fields: Vec<Ident> = Vec::new();
         for f in &dest_shape.names {
             if let Some((_, expr)) = overrides.iter().find(|(name, _)| name == f) {
                 assigns.push((f.clone(), quote! { #expr }));
                 continue;
             }
             let source = if tuple_elems.is_none() {
-                if defaults {
+                if defaults.present() {
                     // Schema collected above — absent fields fall to Default.
                     let present = collected
                         .iter()
                         .any(|(_, s)| !s.is_enum && s.names.contains(f));
                     if !present {
                         defaulted = true;
+                        defaulted_fields.push(f.clone());
                         continue;
                     }
                 }
@@ -831,8 +923,9 @@ pub fn expand(raw: TokenStream2, input: ExpandInput) -> Result<TokenStream, syn:
                     .collect();
                 match hits.as_slice() {
                     [i] => FieldSource::Element(*i),
-                    [] if defaults => {
+                    [] if defaults.present() => {
                         defaulted = true;
+                        defaulted_fields.push(f.clone());
                         continue;
                     }
                     [] => {
@@ -863,7 +956,7 @@ pub fn expand(raw: TokenStream2, input: ExpandInput) -> Result<TokenStream, syn:
                     quote! { #src_var.#i.#f }
                 }
             };
-            if defaults {
+            if defaults.present() {
                 // Autoref-specialized, three tiers: `Option<S>` sources funnel
                 // their inner value (None → default instance's field); plain
                 // funnel next (Option→Option stays None→None); plain source
@@ -932,6 +1025,28 @@ pub fn expand(raw: TokenStream2, input: ExpandInput) -> Result<TokenStream, syn:
                 ));
             }
         }
+        // `..DeclaredDefaults`: the model has to have said so, field by field.
+        if defaults == Trailer::Declared {
+            let undeclared: Vec<String> = defaulted_fields
+                .iter()
+                .filter(|f| !dest_shape.declared.iter().any(|d| d == *f))
+                .map(|f| f.to_string())
+                .collect();
+            if !undeclared.is_empty() {
+                return Err(syn::Error::new_spanned(
+                    &dest,
+                    format!(
+                        "`..DeclaredDefaults` leaves {} unmapped, and the model \
+                         declares no default for {}: give {} a `#[default(..)]`, map {} \
+                         here, or say `..AnyDefault` to accept whatever `Default` gives",
+                        plural(&undeclared),
+                        if undeclared.len() == 1 { "it" } else { "them" },
+                        if undeclared.len() == 1 { "it" } else { "them" },
+                        if undeclared.len() == 1 { "it" } else { "them" },
+                    ),
+                ));
+            }
+        }
         let trailer = defaulted.then(|| quote! { ..::core::default::Default::default() });
         // How the destination gets built. A sealed type has no struct
         // expression available to another crate, so it goes through its
@@ -943,7 +1058,7 @@ pub fn expand(raw: TokenStream2, input: ExpandInput) -> Result<TokenStream, syn:
         let fields: Vec<&Ident> = assigns.iter().map(|(f, _)| f).collect();
         let values: Vec<&TokenStream2> = assigns.iter().map(|(_, v)| v).collect();
         let build = if dest_shape.sealed {
-            if defaulted || defaults {
+            if defaulted || defaults.present() {
                 quote! {{
                     let mut __magic_seal = <#dest as ::core::default::Default>::default();
                     #( __magic_seal.#fields = #values; )*
@@ -956,7 +1071,7 @@ pub fn expand(raw: TokenStream2, input: ExpandInput) -> Result<TokenStream, syn:
             quote! { #dest { #(#fields: #values,)* #trailer } }
         };
 
-        let prelude = defaults.then(|| {
+        let prelude = defaults.present().then(|| {
             quote! { let __magic_fb = <#dest as ::core::default::Default>::default(); }
         });
         if dest_shape.validated {

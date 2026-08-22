@@ -7,7 +7,7 @@ members = ["magic_map", "magic_map_macros", "magic_map_lint", "leaf_provider"]
 exclude = ["compat"]
 
 [workspace.package]
-version = "0.4.1"
+version = "0.5.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/rsansores/magic_map"

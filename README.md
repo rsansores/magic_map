@@ -254,7 +254,7 @@ magic_map!(pub fn postal_code_to_dto: db::PostalCode => dtos::PostalCodeResponse
 satisfied by a local trait just as well as by a local type, so
 `impl LocalMapFrom<Address> for AddressResponse` is legal there even though
 both types are foreign — and the fn form now emits one for every mapping it
-declares. Nested pairs, `Option`, `Vec` and the `..Default::default()` adaptor
+declares. Nested pairs, `Option`, `Vec` and the default trailers
 all compose again:
 
 ```rust
@@ -483,12 +483,33 @@ assert_eq!(species_to_db(wire::Species::Unspecified)?, db::Species::Cat); // zer
 If `wire::Species` grows a `Hamster` variant tomorrow, this declaration stops
 compiling until you decide what `Hamster` maps to — the drift can't ship.
 
-### The `..Default::default()` optionality adaptor
+### Defaults — `..DeclaredDefaults` and `..AnyDefault`
 
-For sparse create/update models, a trailing `..Default::default()` makes the
-mapping default-tolerant. The destination must implement `Default` — put
-business defaults **on the model** (e.g. with [`smart-default`]), and every
-`unwrap_or(business_default)` line disappears from your mappers:
+For sparse create/update models, a trailing default makes the mapping
+default-tolerant: destination fields the source has nothing to say about fall
+back instead of being a compile error. The destination must implement
+`Default`, and business defaults belong **on the model** (e.g. with
+[`smart-default`]), so every `unwrap_or(business_default)` line disappears
+from your mappers.
+
+There are two trailers, because "fall back" covers two unrelated situations
+and only the caller knows which one they are in:
+
+| trailer | a field may be omitted when… |
+|---|---|
+| *(none)* | never — every destination field must be mapped or overridden |
+| `..DeclaredDefaults` | the model declares its own `#[default(..)]` for it |
+| `..AnyDefault` | always — whatever `Default` gives is accepted |
+
+Prefer `..DeclaredDefaults`. It is the one that keeps the compile-time
+guarantee you came here for: add a column to the destination and the mapping
+fails until somebody decides what the column means. `..AnyDefault` answers that
+question in advance, for every column, forever.
+
+`..AnyDefault` is still right in two places — a patch model, whose whole
+contract is "a field absent from the request is a column left untouched", and a
+mapping you have not finished, where it is the honest marker. What it must not
+be is the way a missing-field error gets silenced.
 
 ```rust
 mod api {
@@ -501,27 +522,20 @@ mod api {
 }
 
 mod db {
-    #[derive(Debug, magic_map::MagicMap)]
+    use smart_default::SmartDefault;
+
+    #[derive(Debug, SmartDefault, magic_map::MagicMap)]
     pub struct CreateCat {
         pub name: String,
+        #[default = 9]            // the business default lives HERE
         pub lives: i32,           // required in the row
         pub note: Option<String>,
+        #[default = "new"]
         pub status: String,       // not on the wire at all
-    }
-
-    impl Default for CreateCat {
-        fn default() -> Self {
-            CreateCat {
-                name: String::new(),
-                lives: 9,                // the business default lives HERE
-                note: None,
-                status: "new".into(),
-            }
-        }
     }
 }
 
-magic_map!(api::CreateCatRequest => db::CreateCat { ..Default::default() });
+magic_map!(api::CreateCatRequest => db::CreateCat { ..DeclaredDefaults });
 
 let row: db::CreateCat = api::CreateCatRequest {
     name: "Misifu".into(),
@@ -533,7 +547,7 @@ let row: db::CreateCat = api::CreateCatRequest {
 assert_eq!(row.name, "Misifu"); // plain funnel
 assert_eq!(row.lives, 9);       // None → business default from the model
 assert_eq!(row.note, None);     // Option → Option: None stays None
-assert_eq!(row.status, "new");  // absent from the request → Default::default()
+assert_eq!(row.status, "new");  // absent from the request → its declared default
 ```
 
 Three behaviors compose, picked automatically per field:
@@ -560,7 +574,7 @@ mod seen {
     }
 }
 
-magic_map!(seen::CatSeen => seen::CatPatch { ..Default::default() });
+magic_map!(seen::CatSeen => seen::CatPatch { ..AnyDefault });
 
 let patch: seen::CatPatch = seen::CatSeen {
     chip_id: "67e55044-10b1-426f-9247-bb680e5fe0c8".into(),
@@ -581,9 +595,14 @@ assert!(bad.is_err());
 If `None` means "don't touch" on your patch models, keep explicit `Some(...)`
 wraps in those mappers instead.
 
-Use the trailer deliberately: it trades the missing-field compile error for
-defaulting. Without it, `CreateCat`'s `status` field would have been a compile
-error asking for an override.
+`status` is on neither the request nor the overrides, so `..DeclaredDefaults`
+lets it through only because `#[default = "new"]` says what it is. Drop that
+attribute and the mapping stops compiling, naming the field — which is the
+point. Without any trailer at all, `status` would need an explicit override.
+
+`#[default(..)]` is read as an attribute, so any derive using that spelling
+works; [`smart-default`] is the one these examples use. magic_map does not
+depend on it.
 
 [`smart-default`]: https://crates.io/crates/smart-default
 
@@ -696,7 +715,7 @@ Sources may be borrowed:
 magic_map!(infallible fn fiscal: &CompanyPayload => FiscalFields { … });
 ```
 
-One restriction: the `..Default::default()` trailer cannot be `infallible` —
+One restriction: a default trailer cannot be `infallible` —
 the default funnel is fallible by construction, and the macro says so.
 
 ## Sealing — `#[mapped(sealed)]`

@@ -381,7 +381,7 @@ mod wrap {
 // goes through the plain funnel, so a `None` source stays `None` — never
 // `Some`-wrapped into existence.
 magic_map!(wrap::SyncSource => wrap::SyncRow {
-    ..Default::default()
+    ..AnyDefault
 });
 
 #[test]
@@ -415,16 +415,16 @@ fn wrap_tier_is_strict_through_the_funnel() {
     assert!(res.is_err(), "garbage must not become Some(default)");
 }
 
-// `..Default::default()`: `name` automaps; `status`/`notes` (absent from the
+// `..AnyDefault`: `name` automaps; `status`/`notes` (absent from the
 // request) fall back to Default instead of erroring.
 magic_map!(sparse::PatchRequest => sparse::UpdateRow {
-    ..Default::default()
+    ..AnyDefault
 });
 
 // Option<S> sources land in non-Option dests by unwrapping through the
 // funnel, falling back to the DEFAULT INSTANCE's field value on None.
 magic_map!(sparse::CreateRequest => sparse::CreateRow {
-    ..Default::default()
+    ..AnyDefault
 });
 
 #[test]
@@ -576,7 +576,7 @@ mod validated_defaults {
 }
 
 magic_map!(validated_defaults::RawCreate => validated_defaults::NewRecord {
-    ..Default::default()
+    ..AnyDefault
 });
 
 #[test]
@@ -1019,3 +1019,75 @@ fn leaves_arrive_from_a_provider_crate() {
     assert_eq!(dto.species_label, "Lion");
     assert_eq!(dto.temp, "72F");
 }
+
+// ── `..DeclaredDefaults` — the model has to have said so ─────────────────────
+
+mod declared {
+    use smart_default::SmartDefault;
+
+    #[derive(magic_map::MagicMap)]
+    pub struct NewOrderRequest {
+        pub reference: String,
+    }
+
+    #[derive(Debug, SmartDefault, magic_map::MagicMap)]
+    pub struct NewOrder {
+        pub reference: String,
+        // Absent from the request, and the model says what that means.
+        #[default = "pending"]
+        pub status: String,
+        #[default = 1]
+        pub attempts: i32,
+    }
+
+    /// The same row with one field the model says nothing about.
+    #[derive(Debug, Default, magic_map::MagicMap)]
+    pub struct LooseOrder {
+        pub reference: String,
+        pub status: String,
+    }
+}
+
+magic_map!(declared::NewOrderRequest => declared::NewOrder { ..DeclaredDefaults });
+
+#[test]
+fn declared_defaults_fills_only_what_the_model_declared() {
+    let row: declared::NewOrder = declared::NewOrderRequest {
+        reference: "ORD-1".into(),
+    }
+    .try_map_into()
+    .expect("declared defaults");
+    assert_eq!(row.reference, "ORD-1");
+    assert_eq!(row.status, "pending");
+    assert_eq!(row.attempts, 1);
+}
+
+// `..AnyDefault` takes the same mapping without the model declaring anything —
+// this is the rung you drop to when a mapping is not finished.
+magic_map!(declared::NewOrderRequest => declared::LooseOrder { ..AnyDefault });
+
+#[test]
+fn any_default_takes_whatever_default_gives() {
+    let row: declared::LooseOrder = declared::NewOrderRequest {
+        reference: "ORD-2".into(),
+    }
+    .try_map_into()
+    .expect("any default");
+    assert_eq!(row.status, ""); // no declaration, so: whatever Default gives
+}
+
+// ── what 0.5 rejects ─────────────────────────────────────────────────────────
+// Written down rather than merely believed. Each is a hard error:
+//
+//   magic_map!(declared::NewOrderRequest => declared::LooseOrder {
+//       ..DeclaredDefaults        // `status` unmapped, model declares no default
+//   });
+//
+//   magic_map!(declared::NewOrderRequest => declared::LooseOrder {
+//       reference: src.reference, // identity override — the automap does this
+//       ..AnyDefault
+//   });
+//
+//   magic_map!(declared::NewOrderRequest => declared::LooseOrder {
+//       ..Default::default()      // removed in 0.5; say which defaults you mean
+//   });

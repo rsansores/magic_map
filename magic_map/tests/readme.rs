@@ -284,7 +284,7 @@ fn enum_mappings() -> Result<(), MappingError> {
     Ok(())
 }
 
-// ── `..Default::default()` optionality adaptor ───────────────────────────────
+// ── Defaults — `..DeclaredDefaults` and `..AnyDefault` ───────────────────────
 
 mod defaults_trailer {
     pub mod api {
@@ -297,28 +297,23 @@ mod defaults_trailer {
     }
 
     pub mod db {
-        #[derive(Debug, magic_map::MagicMap)]
+        use smart_default::SmartDefault;
+
+        #[derive(Debug, SmartDefault, magic_map::MagicMap)]
         pub struct CreateCat {
             pub name: String,
+            #[default = 9] // the business default lives HERE
             pub lives: i32, // required in the row
             pub note: Option<String>,
+            #[default = "new"]
             pub status: String, // not on the wire at all
-        }
-
-        impl Default for CreateCat {
-            fn default() -> Self {
-                CreateCat {
-                    name: String::new(),
-                    lives: 9, // the business default lives HERE
-                    note: None,
-                    status: "new".into(),
-                }
-            }
         }
     }
 
     use magic_map::magic_map;
-    magic_map!(api::CreateCatRequest => db::CreateCat { ..Default::default() });
+    // `status` is on neither the request nor the overrides. It may be left out
+    // only because the model declares what it is.
+    magic_map!(api::CreateCatRequest => db::CreateCat { ..DeclaredDefaults });
 }
 
 #[test]
@@ -335,7 +330,7 @@ fn defaults_trailer() -> Result<(), MappingError> {
     assert_eq!(row.name, "Misifu"); // plain funnel
     assert_eq!(row.lives, 9); // None → business default from the model
     assert_eq!(row.note, None); // Option → Option: None stays None
-    assert_eq!(row.status, "new"); // absent from the request → Default::default()
+    assert_eq!(row.status, "new"); // absent from the request → its declared default
 
     let row2: db::CreateCat = api::CreateCatRequest {
         name: "Firulais".into(),
@@ -366,7 +361,7 @@ mod wrap_tier {
     }
 
     use magic_map::magic_map;
-    magic_map!(seen::CatSeen => seen::CatPatch { ..Default::default() });
+    magic_map!(seen::CatSeen => seen::CatPatch { ..AnyDefault });
 }
 
 #[test]
