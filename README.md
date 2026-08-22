@@ -1,11 +1,13 @@
 # magic_map
 
+> Upgrading from 0.3? See [MIGRATING.md](./MIGRATING.md) — one rename, three new capabilities.
+
 Declaration-site, fallible struct/enum mapping for Rust — automap between
 types you **don't own** (DB rows, prost-generated protos, OpenAPI DTOs) with
 strict, compile-checked conversions.
 
 ```rust
-use magic_map::{magic_map, MapInto};
+use magic_map::{magic_map, TryMapInto};
 
 // The mapping is a standalone declaration — not an attribute on the type.
 magic_map!(db::Cat => api::CatDto {
@@ -17,7 +19,7 @@ magic_map!(db::Cat => api::CatDto {
 // nested mapped enums/structs… and a typo'd or newly-added field is a
 // COMPILE error, not a silently-unmapped field.
 
-let dto: api::CatDto = cat.map_into()?;
+let dto: api::CatDto = cat.try_map_into()?;
 ```
 
 ## Why another mapper?
@@ -79,7 +81,7 @@ touch on the [issue tracker](https://github.com/rsansores/magic_map/issues).
 
 ```toml
 [dependencies]
-magic_map = { version = "0.1", features = ["uuid", "chrono", "decimal"] }
+magic_map = { version = "0.4", features = ["uuid", "chrono", "decimal"] }
 ```
 
 Two layers that never import each other, and an empty mapping declaration —
@@ -112,7 +114,7 @@ mod mappers {
     magic_map!(super::db::Cat => super::api::CatDto);
 }
 
-use magic_map::MapInto;
+use magic_map::TryMapInto;
 
 let dto: api::CatDto = db::Cat {
     id: uuid::Uuid::nil(),
@@ -120,7 +122,7 @@ let dto: api::CatDto = db::Cat {
     age: 3,
     born: "2024-01-15T10:30:00Z".parse().unwrap(),
 }
-.map_into()?;
+.try_map_into()?;
 
 assert_eq!(dto.id, "00000000-0000-0000-0000-000000000000");
 assert_eq!(dto.name, "Misifu");
@@ -140,7 +142,7 @@ so what the README claims is what CI compiles and runs.
 
 ### impl form
 
-Generates `impl MapFrom<Src> for Dest`. Legal when your crate owns `Src` or
+Generates `impl TryMapFrom<Src> for Dest`. Legal when your crate owns `Src` or
 `Dest` (the usual db→dto / dto→db case). Override a field when it is absent
 from the source or needs an expression; everything else automaps:
 
@@ -166,7 +168,7 @@ magic_map!(db::Dog => api::DogDto {
     big: src.weight_kg > 30.0,
 });
 
-let dto: api::DogDto = db::Dog { name: "Rex".into(), weight_kg: 38.5 }.map_into()?;
+let dto: api::DogDto = db::Dog { name: "Rex".into(), weight_kg: 38.5 }.try_map_into()?;
 assert_eq!(dto.name, "Rex");
 assert!(dto.big);
 ```
@@ -232,8 +234,8 @@ at the crate root (`lib.rs`, `main.rs`, or the top of an integration test —
 integration tests are their own crate). Crates whose mappings are all impl
 form never call it.
 
-**Why it exists.** A mapping's *fields* funnel through `MapFrom` too. That is
-fine for the impl form, which leaves a `MapFrom` impl behind for the next
+**Why it exists.** A mapping's *fields* funnel through `TryMapFrom` too. That is
+fine for the impl form, which leaves a `TryMapFrom` impl behind for the next
 mapping to find. The fn form leaves none — so before this existed, a nested
 field whose own mapping was also foreign→foreign had nothing to resolve
 against, and you hand-wrote the recursion:
@@ -281,9 +283,14 @@ magic_map::magic_map_leaves! {
     identity: [crate::enums::Species],
     display:  [crate::enums::Species],
     parse:    [crate::enums::Species],
-    // A pair whose impl you wrote by hand. The impl stays where it is; only
-    // the pair is registered, because a macro cannot see an impl.
-    custom:   [crate::wire::Fahrenheit => String],
+    custom: [
+        // A pair whose impl you wrote by hand. The impl stays where it is;
+        // only the pair is registered, because a macro cannot see an impl.
+        crate::wire::Fahrenheit => String,
+        // A hand impl that cannot fail is a `MapFrom` impl plus this marker —
+        // that one impl then backs both funnels, fallible and infallible.
+        infallible crate::wire::Celsius => String,
+    ],
 }
 ```
 
@@ -299,7 +306,7 @@ side. Write your own types as `crate::…` — those paths are republished as
 else (`String`, `::chrono::DateTime<..>`) passes through verbatim.
 
 For a one-off pair whose crate has no block, `leaves:` takes it inline — a bare
-type is its identity, `Src => Dest` one direction. A wrapper whose own `MapFrom`
+type is its identity, `Src => Dest` one direction. A wrapper whose own `TryMapFrom`
 impl is generic goes in `generic_leaves`, `;`-separated so the `where` clause's
 commas stay unambiguous:
 
@@ -308,7 +315,7 @@ magic_map::magic_map_scope! {
     from: [my_db],
     leaves: [Celsius, Celsius => String],
     generic_leaves: {
-        <S, D> Patch<S> => Patch<D> where D: ::magic_map::MapFrom<S>;
+        <S, D> Patch<S> => Patch<D> where D: ::magic_map::TryMapFrom<S>;
     },
 }
 ```
@@ -320,7 +327,7 @@ types: ``the trait bound `String: LocalMapFrom<Celsius>` is not satisfied``.
 
 Two shortcuts look obvious and neither is available.
 
-A blanket bridge forwarding every existing `MapFrom` into the local trait
+A blanket bridge forwarding every existing `TryMapFrom` into the local trait
 overlaps the per-pair impls, and coherence cannot rule the overlap out because
 either upstream crate could add the conflicting impl later:
 
@@ -328,10 +335,10 @@ either upstream crate could add the conflicting impl later:
 error[E0119]: conflicting implementations of trait `LocalMapFrom<Address>`
               for type `AddressResponse`
    = note: upstream crates may add a new impl of trait
-           `MapFrom<Address>` for type `AddressResponse` in future versions
+           `TryMapFrom<Address>` for type `AddressResponse` in future versions
 ```
 
-Nor can a second, `MapFrom`-backed tier sit underneath to catch leaves.
+Nor can a second, `TryMapFrom`-backed tier sit underneath to catch leaves.
 Autoref tiering needs the tiers told apart by receiver *shape*, as
 `MapFieldOpt`/`MapFieldVal`/`MapFieldWrap` are; a tier separated only by a
 where-bound hard-errors rather than falling through. And a concrete per-pair
@@ -376,7 +383,7 @@ assert_eq!(stats.midpoint, 15);
 
 ### Tuple sources
 
-`impl MapFrom<(A, B, ...)> for Dest` — call sites do `(a, b).map_into()?`.
+`impl TryMapFrom<(A, B, ...)> for Dest` — call sites do `(a, b).try_map_into()?`.
 Plain non-generic struct elements are **open**: they must derive `MagicMap`
 and their fields join the auto-match. Generic types, references and
 primitives are **opaque**: reachable only as `src.N` in overrides.
@@ -419,7 +426,7 @@ let card: api::AdoptionCard = (
     db::Owner { id: 99, name: "Ricardo".into() },
     Some("indoor only".to_string()),
 )
-    .map_into()?;
+    .try_map_into()?;
 
 assert_eq!(card.id, 99);       // picked from Owner
 assert_eq!(card.name, "Misifu"); // picked from Cat
@@ -521,7 +528,7 @@ let row: db::CreateCat = api::CreateCatRequest {
     lives: None,
     note: None,
 }
-.map_into()?;
+.try_map_into()?;
 
 assert_eq!(row.name, "Misifu"); // plain funnel
 assert_eq!(row.lives, 9);       // None → business default from the model
@@ -559,7 +566,7 @@ let patch: seen::CatPatch = seen::CatSeen {
     chip_id: "67e55044-10b1-426f-9247-bb680e5fe0c8".into(),
     weight_kg: 4.2,
 }
-.map_into()?;
+.try_map_into()?;
 assert!(patch.chip_id.is_some());
 
 // Still strict: a bad chip_id is an Err — never Some(Uuid::nil()).
@@ -567,7 +574,7 @@ let bad: Result<seen::CatPatch, _> = seen::CatSeen {
     chip_id: "not-a-uuid".into(),
     weight_kg: 4.2,
 }
-.map_into();
+.try_map_into();
 assert!(bad.is_err());
 ```
 
@@ -620,7 +627,7 @@ let user: db::NewUser = api::CreateUserRequest {
     email: "alice@example.com".into(),
     age: 30,
 }
-.map_into()?;
+.try_map_into()?;
 
 // Invalid input → Err(MappingError::Validation(...))
 let bad: Result<db::NewUser, _> = api::CreateUserRequest {
@@ -628,14 +635,14 @@ let bad: Result<db::NewUser, _> = api::CreateUserRequest {
     email: "not-an-email".into(),
     age: 30,
 }
-.map_into();
+.try_map_into();
 assert!(matches!(bad, Err(magic_map::MappingError::Validation(_))));
 ```
 
 Enable the feature in `Cargo.toml`:
 
 ```toml
-magic_map = { version = "0.2", features = ["validate"] }
+magic_map = { version = "0.4", features = ["validate"] }
 ```
 
 Validation runs after all field conversions succeed — a type error (e.g. a bad
@@ -652,10 +659,128 @@ ever called.
 
 [validator]: https://crates.io/crates/validator
 
+## Fallible and infallible
+
+Two pairs, mirroring `From` / `TryFrom`:
+
+| | infallible | fallible |
+|---|---|---|
+| trait | `MapFrom` / `MapInto` | `TryMapFrom` / `TryMapInto` |
+| method | `map_from` / `map_into` | `try_map_from` / `try_map_into` |
+| returns | `Self` | `Result<Self, MappingError>` |
+| declared | `magic_map!(infallible …)` | `magic_map!(…)` |
+
+A mapping is infallible when every field pair is an identity, a lossless
+widening, or another infallible mapping. `String` → `Uuid` parses, so it is not.
+
+```rust
+magic_map!(infallible db::Tenant => wire::Tenant);
+
+let t: wire::Tenant = row.map_into();   // no `?`
+```
+
+The claim is checked rather than trusted: the expansion contains no `?`, so a
+field pair with only a `TryMapFrom` route fails to resolve. Infallible mappings
+also get the fallible half generated, so `try_map_into()` keeps working on them.
+
+Enum mappings can be infallible too — variant-to-variant over unit enums
+carries no decision. And infallible fn-forms **compose**: `magic_map_scope!`
+plants an infallible local funnel beside the fallible one, so an
+`infallible fn` mapping nests another foreign→foreign `infallible fn` mapping
+exactly as fallible ones always nested. What flows into that funnel is decided
+by the leaves — see [leaf fallibility](#leaf-fallibility).
+
+Sources may be borrowed:
+
+```rust
+magic_map!(infallible fn fiscal: &CompanyPayload => FiscalFields { … });
+```
+
+One restriction: the `..Default::default()` trailer cannot be `infallible` —
+the default funnel is fallible by construction, and the macro says so.
+
+## Sealing — `#[mapped(sealed)]`
+
+The failure worth preventing is not a wrong `From` impl. It is the
+field-by-field copy typed straight into a service or a controller, using no
+trait at all — which no linter catches reliably, since a grep cannot tell
+construction from destructuring.
+
+`#[mapped(sealed)]` adds `#[non_exhaustive]` and a hidden all-fields
+constructor. From any other crate the type then has no struct expression:
+
+```rust
+#[mapped(sealed)]                       // must come before the derives
+#[derive(Serialize, Deserialize, Clone)]
+pub struct CustomerDto { … }
+```
+```
+error[E0639]: cannot create non-exhaustive struct using struct expression
+```
+
+`magic_map!` builds through the constructor, so declared mappings are
+unaffected. Banning `impl From` needs no separate feature — a `From` impl for a
+sealed type cannot construct its own output either.
+
+It is an attribute, not a derive, because a derive is additive-only and can
+never place an attribute on the item it derives. It is `#[mapped]` rather than
+`#[magic_map]` because the latter would collide with the `magic_map!` macro.
+
+Sealing reaches any type whose owning crate is not the one doing the mapping —
+in a layered codebase, that is DTOs, database models and generated protos. It
+does **not** reach types local to the mapping crate, conversions *out of* a
+sealed type, or anything not sealed. `#[mapped]` with no argument is exactly
+`#[derive(MagicMap)]`, so adoption is per-type.
+
+`#[mapped]` skips shapes where sealing would only cost: unit and tuple structs,
+enums, and field-less markers such as a proto `Empty`.
+
+For the three places sealing cannot reach, there is the
+[lint](#linting--magic-map-lint).
+
+## Linting — `magic-map-lint`
+
+Sealing is a compile-time wall, but it has three blind spots: types local to
+the mapping crate, conversions *out of* a sealed type, and anything you chose
+not to seal. The escape hatch that grows back in all three is a hand-written
+std conversion impl — so the repo ships a linter that finds exactly that.
+
+`magic_map_lint` is a standalone binary crate (syn-based, so it tells an
+`impl` from a use and needs no compilation of your code):
+
+```sh
+cargo install magic_map_lint
+magic-map-lint --allow .magic-map-allow src/ crates/
+```
+
+It walks the given paths and flags every `impl From / Into / TryFrom /
+TryInto`, with two deliberate exemptions:
+
+- **Error conversions.** `impl From<MappingError> for ApiError` is how `?`
+  bubbles between layers; an impl where either side's type name ends in
+  `Error` is not a data mapping.
+- **The allowlist** — one rendered signature per line, `#` for comments:
+
+  ```text
+  # newtype ↔ inner ergonomics, not a layer mapping
+  impl From<Tz> for TimeZone
+  impl From<TimeZone> for Tz
+  ```
+
+  The list only shrinks: an entry that no longer matches anything fails the
+  run, so paid-off debt cannot linger and hide new violations.
+
+Exit code 1 on any violation or stale entry — wire it into your lint recipe /
+CI next to clippy. The intended division of labour: **seal** what must only be
+built by declared mappings, **lint** the conversion impls everywhere else.
+
 ## Leaves
 
-A *leaf* is a `MapFrom` impl for a known type pair. Identities for primitives
-and `String` ship always; third-party leaves are feature-gated:
+A *leaf* is a conversion impl for a known type pair — `TryMapFrom` always, plus
+`MapFrom` when the conversion cannot fail (identities, widenings, `Uuid`→
+`String`, `Display` routes), which is what lets it appear inside `infallible`
+mappings. Identities for primitives and `String` ship always; third-party
+leaves are feature-gated:
 
 | feature    | leaves / behavior |
 |------------|-------------------|
@@ -688,12 +813,21 @@ magic_map::map_display!(Species);  // Species → String fields automap
 magic_map::map_parse!(Species);    // String → Species fields automap, strictly
 
 // Or hand-write any pair:
-impl magic_map::MapFrom<MyWireTimestamp> for chrono::DateTime<chrono::Utc> {
-    fn map_from(src: MyWireTimestamp) -> Result<Self, magic_map::MappingError> {
+impl magic_map::TryMapFrom<MyWireTimestamp> for chrono::DateTime<chrono::Utc> {
+    fn try_map_from(src: MyWireTimestamp) -> Result<Self, magic_map::MappingError> {
         /* strict conversion */
     }
 }
 ```
+
+<a name="leaf-fallibility"></a>
+**Leaf fallibility.** `map_identity!` and `map_display!` emit the infallible
+`MapFrom` twin automatically — an identity or a `Display` cannot fail — so
+those routes work inside `infallible` mappings out of the box. `map_parse!`
+stays fallible. A hand-written pair that cannot fail writes one `MapFrom` impl
+and registers with the `infallible` prefix in `magic_map_leaves!` (shown
+above); a pair left unmarked keeps working fallibly — marking is only what
+lets it serve `infallible` declarations.
 
 These automap everywhere the impl form is used. To reach them from a **fn-form**
 mapping too, declare them with [`magic_map_leaves!`](#reaching-your-leaves)
@@ -703,18 +837,27 @@ instead — same impls, plus the published list a consumer's scope replays.
 
 ## prost / generated-code recipe
 
-In `build.rs`, plant the derive on every generated type:
+In `build.rs`, plant the schema on every generated type — and seal the
+packages that are mapping *destinations*, path-scoped, so the declared mapping
+is the only way to build one outside the proto crate. Request/args/confirm
+packages stay on the plain attribute: clients assemble those from local state,
+which is parameter construction, not mapping.
 
 ```rust
 prost_build::Config::new()
-    .type_attribute(".", "#[derive(magic_map::MagicMap)]")
-    .compile_protos(&["proto/models.proto"], &["proto/"])?;
+    // model types: schema + seal — hand-rolled copies stop compiling
+    .type_attribute(".mypkg.models", "#[magic_map::mapped(sealed)]")
+    // message/args types: schema only — still constructible by clients
+    .type_attribute(".mypkg.rpc", "#[magic_map::mapped]")
+    .compile_protos(&["proto/models.proto", "proto/rpc.proto"], &["proto/"])?;
 ```
 
 Unsupported shapes (tuple structs, enums with payload variants) are a silent
-no-op, so the blanket attribute is safe. If two same-named types exist in one
-crate (e.g. `pkg_a.Sale` and `pkg_b.Sale`), disambiguate one's hidden export:
-`#[magic_map(export = "PkgASale")]`.
+no-op, and sealing skips unit/zero-field markers such as a proto `Empty`, so
+package-level attributes are safe. If two same-named types exist in one crate
+(e.g. `pkg_a.Sale` and `pkg_b.Sale`), disambiguate one's hidden export —
+either form works: `#[magic_map(export = "PkgASale")]` next to a derive, or
+`#[magic_map::mapped(sealed, export = "PkgASale")]` in one attribute.
 
 Then map proto↔db in a service crate with the fn form — no crate ever
 depends on the other's "shape".
@@ -732,11 +875,16 @@ decision for the handler that owns the batch, not for the conversion.
   must be a direct dependency, not renamed.
 - Two same-named `MagicMap` types in one crate collide on the hidden
   crate-root export — rename one or use `#[magic_map(export = "...")]`.
+- A *type* re-exported at a crate root (`pub use context::TenantContext`)
+  does not carry its schema alias along — a destination path must go through
+  the defining module (`commons::context::TenantContext`) or a *module*
+  re-export, or the mapping fails with ``could not find
+  `__magic_map_schema_…` ``.
 - Destination types must have named fields (or unit variants); tuple structs
   are not supported as destinations.
 - The fn form needs [`magic_map_scope!`](#magic_map_scope--the-fn-forms-crate-local-funnel)
   in the crate root, naming the crates whose leaves it uses. Coherence allows no
-  automatic bridge from `MapFrom` — see that section for the compiler's own
+  automatic bridge from `TryMapFrom` — see that section for the compiler's own
   reasoning — so leaves are delegated in, and `magic_map_leaves!` keeps that from
   becoming per-consumer bookkeeping.
 

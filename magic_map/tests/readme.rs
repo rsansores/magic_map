@@ -11,7 +11,7 @@
 // `magic_map_scope!` section. Once, at the crate root, no arguments.
 magic_map::magic_map_scope!(from: [leaf_provider]);
 
-use magic_map::{MapInto, MappingError};
+use magic_map::{MappingError, TryMapInto};
 
 // ── Quick start ──────────────────────────────────────────────────────────────
 
@@ -53,7 +53,7 @@ fn quick_start() -> Result<(), MappingError> {
         age: 3,
         born: "2024-01-15T10:30:00Z".parse().unwrap(),
     }
-    .map_into()?;
+    .try_map_into()?;
 
     assert_eq!(dto.id, "00000000-0000-0000-0000-000000000000");
     assert_eq!(dto.name, "Misifu");
@@ -96,7 +96,7 @@ fn impl_form() -> Result<(), MappingError> {
         name: "Rex".into(),
         weight_kg: 38.5,
     }
-    .map_into()?;
+    .try_map_into()?;
     assert_eq!(dto.name, "Rex");
     assert!(dto.big);
     Ok(())
@@ -234,7 +234,7 @@ fn tuple_sources() -> Result<(), MappingError> {
         },
         Some("indoor only".to_string()),
     )
-        .map_into()?;
+        .try_map_into()?;
 
     assert_eq!(card.id, 99); // picked from Owner
     assert_eq!(card.name, "Misifu"); // picked from Cat
@@ -330,7 +330,7 @@ fn defaults_trailer() -> Result<(), MappingError> {
         lives: None,
         note: None,
     }
-    .map_into()?;
+    .try_map_into()?;
 
     assert_eq!(row.name, "Misifu"); // plain funnel
     assert_eq!(row.lives, 9); // None → business default from the model
@@ -342,7 +342,7 @@ fn defaults_trailer() -> Result<(), MappingError> {
         lives: Some(7),
         note: Some("bites".into()),
     }
-    .map_into()?;
+    .try_map_into()?;
     assert_eq!(row2.lives, 7); // Some → unwrapped through the funnel
     assert_eq!(row2.note.as_deref(), Some("bites"));
     Ok(())
@@ -377,7 +377,7 @@ fn wrap_tier() -> Result<(), MappingError> {
         chip_id: "67e55044-10b1-426f-9247-bb680e5fe0c8".into(),
         weight_kg: 4.2,
     }
-    .map_into()?;
+    .try_map_into()?;
     assert!(patch.chip_id.is_some());
     assert!(patch.weight_kg.is_some());
 
@@ -386,7 +386,7 @@ fn wrap_tier() -> Result<(), MappingError> {
         chip_id: "not-a-uuid".into(),
         weight_kg: 4.2,
     }
-    .map_into();
+    .try_map_into();
     assert!(bad.is_err());
     Ok(())
 }
@@ -429,7 +429,7 @@ fn validation() -> Result<(), MappingError> {
         email: "alice@example.com".into(),
         age: 30,
     }
-    .map_into()?;
+    .try_map_into()?;
     assert_eq!(user.name, "Alice");
     assert_eq!(user.age, 30_i64);
 
@@ -439,7 +439,7 @@ fn validation() -> Result<(), MappingError> {
         email: "not-an-email".into(),
         age: 30,
     }
-    .map_into();
+    .try_map_into();
     assert!(matches!(bad, Err(magic_map::MappingError::Validation(_))));
     Ok(())
 }
@@ -464,8 +464,8 @@ mod leaves {
         pub seconds: i64,
     }
 
-    impl magic_map::MapFrom<MyWireTimestamp> for chrono::DateTime<chrono::Utc> {
-        fn map_from(src: MyWireTimestamp) -> Result<Self, magic_map::MappingError> {
+    impl magic_map::TryMapFrom<MyWireTimestamp> for chrono::DateTime<chrono::Utc> {
+        fn try_map_from(src: MyWireTimestamp) -> Result<Self, magic_map::MappingError> {
             chrono::DateTime::from_timestamp(src.seconds, 0).ok_or(
                 magic_map::MappingError::OutOfRange {
                     field: "<timestamp>",
@@ -479,16 +479,16 @@ mod leaves {
 fn custom_leaves() -> Result<(), MappingError> {
     use leaves::{MyWireTimestamp, Species};
 
-    let s: String = Species::Lion.map_into()?;
+    let s: String = Species::Lion.try_map_into()?;
     assert_eq!(s, "Lion");
 
-    let back: Species = "Lion".to_string().map_into()?;
+    let back: Species = "Lion".to_string().try_map_into()?;
     assert_eq!(back, Species::Lion);
 
-    let bad: Result<Species, _> = "Liger".to_string().map_into();
+    let bad: Result<Species, _> = "Liger".to_string().try_map_into();
     assert!(bad.is_err()); // strict parse
 
-    let ts: chrono::DateTime<chrono::Utc> = MyWireTimestamp { seconds: 0 }.map_into()?;
+    let ts: chrono::DateTime<chrono::Utc> = MyWireTimestamp { seconds: 0 }.try_map_into()?;
     assert_eq!(ts.to_rfc3339(), "1970-01-01T00:00:00+00:00");
     Ok(())
 }

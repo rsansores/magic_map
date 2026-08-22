@@ -7,7 +7,7 @@
 //! does not exist here) — it just maps the fields. If this crate compiles, the
 //! gating holds.
 
-use magic_map::{magic_map, MagicMap, MapInto};
+use magic_map::{magic_map, MagicMap, TryMapInto};
 use validator::Validate;
 
 #[derive(MagicMap)]
@@ -33,6 +33,6 @@ pub fn maps_without_validating() -> ValidatedDto {
         name: String::new(),
         email: "not-an-email".into(),
     }
-    .map_into()
+    .try_map_into()
     .unwrap()
 }

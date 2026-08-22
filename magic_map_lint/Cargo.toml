@@ -1,0 +1,15 @@
+[package]
+name = "magic_map_lint"
+version = "0.4.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Finds hand-written std conversion impls (From/Into/TryFrom/TryInto) that bypass magic_map"
+repository = "https://github.com/rsansores/magic_map"
+
+[[bin]]
+name = "magic-map-lint"
+path = "src/main.rs"
+
+[dependencies]
+syn = { version = "2", default-features = false, features = ["full", "parsing", "visit"] }
+proc-macro2 = { version = "1", features = ["span-locations"] }

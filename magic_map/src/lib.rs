@@ -3,7 +3,7 @@
 //! `magic_map!` declares a mapping between two types as a standalone
 //! statement — not as attributes on the types. Every destination field
 //! without an explicit override is auto-filled from the same-named source
-//! field through the [`MapFrom`] leaf funnel, so identities, `String↔Uuid`,
+//! field through the [`TryMapFrom`] leaf funnel, so identities, `String↔Uuid`,
 //! `Decimal↔f64`, `Option`/`Vec` wrappers, and previously-mapped enums and
 //! structs compose for free — and every conversion that can lose information
 //! is fallible and surfaces a [`MappingError`].
@@ -21,7 +21,7 @@
 //! including why custom leaves have to be named there.
 //!
 //! ```
-//! use magic_map::{magic_map, MagicMap, MapInto};
+//! use magic_map::{magic_map, MagicMap, TryMapInto};
 //!
 //! mod db {
 //!     #[derive(magic_map::MagicMap)]
@@ -51,7 +51,7 @@
 //!     name: "Ada".into(),
 //!     age: 36,
 //! }
-//! .map_into()
+//! .try_map_into()
 //! .unwrap();
 //! assert_eq!(dto.age, 36);
 //! assert!(!dto.vip);
@@ -76,16 +76,31 @@
 //! | `full`     | all of the above                                                         |
 //!
 //! Leaves for your **own** types are declared with [`map_identity!`],
-//! [`map_display!`], [`map_parse!`], or a plain `MapFrom` impl in the crate
+//! [`map_display!`], [`map_parse!`], or a plain `TryMapFrom` impl in the crate
 //! that owns the type.
 
 use std::error::Error;
 use std::fmt;
 
-pub use magic_map_macros::{magic_map, magic_map_leaves, MagicMap};
+pub use magic_map_macros::{magic_map, magic_map_leaves, mapped, MagicMap};
 
 #[doc(hidden)]
 pub use magic_map_macros::__magic_map_expand;
+
+// The scope leaf groups name third-party leaf types through these, so a crate
+// calling `magic_map_scope!` does not need uuid/chrono/decimal/json as direct
+// dependencies just because this crate's features enable those leaves.
+#[doc(hidden)]
+pub mod __rx {
+    #[cfg(feature = "chrono")]
+    pub use chrono;
+    #[cfg(feature = "decimal")]
+    pub use rust_decimal;
+    #[cfg(feature = "json")]
+    pub use serde_json;
+    #[cfg(feature = "uuid")]
+    pub use uuid;
+}
 
 // Re-exported so generated code can reach the `Validate` trait as
 // `::magic_map::validator::Validate` without the call-site (or a neutral mapper
@@ -185,33 +200,59 @@ impl From<rust_decimal::Error> for MappingError {
 /// Fallible field/struct/enum conversion. Implemented by `magic_map!` for
 /// structs and enums, and by the leaf impls below for known type pairs.
 ///
-/// Orphan-rule note: a `MapFrom<Src> for Dest` impl is only legal in a crate
+/// Orphan-rule note: a `TryMapFrom<Src> for Dest` impl is only legal in a crate
 /// that owns `Dest` or `Src`. Mappings where one side is local use the impl
 /// form of `magic_map!`. Foreign→foreign mappings (e.g. db→proto in a neutral
 /// service crate) cannot carry a trait impl at all — use the fn form
 /// (`magic_map!(pub fn name: Src => Dest)`), which still reuses the leaf
 /// conversions.
-pub trait MapFrom<S>: Sized {
-    fn map_from(src: S) -> Result<Self, MappingError>;
+pub trait TryMapFrom<S>: Sized {
+    fn try_map_from(src: S) -> Result<Self, MappingError>;
 }
 
-/// Call-side ergonomics: `let dto: Dto = db.map_into()?;`
+/// Call-side ergonomics: `let dto: Dto = db.try_map_into()?;`
+pub trait TryMapInto<D> {
+    fn try_map_into(self) -> Result<D, MappingError>;
+}
+impl<S, D: TryMapFrom<S>> TryMapInto<D> for S {
+    fn try_map_into(self) -> Result<D, MappingError> {
+        D::try_map_from(self)
+    }
+}
+
+/// Infallible struct/enum conversion — the half of the funnel that carries no
+/// decision. A mapping is infallible when every field pair is: an identity, a
+/// lossless widening, or another infallible mapping. `String` → `Uuid` is not,
+/// and that asymmetry is the whole point — a conversion that can fail says so
+/// in its type, and one that cannot does not make every call site pretend.
+///
+/// `magic_map!(infallible ...)` emits this. The check is structural rather
+/// than declarative: the expansion has no `?` in it, so a field pair that only
+/// has `TryMapFrom` fails to resolve. You cannot claim infallible wrongly.
+pub trait MapFrom<S>: Sized {
+    fn map_from(src: S) -> Self;
+}
+
+/// Call-side ergonomics: `let dto: Dto = db.map_into();` — no `?`.
 pub trait MapInto<D> {
-    fn map_into(self) -> Result<D, MappingError>;
+    fn map_into(self) -> D;
 }
 impl<S, D: MapFrom<S>> MapInto<D> for S {
-    fn map_into(self) -> Result<D, MappingError> {
+    fn map_into(self) -> D {
         D::map_from(self)
     }
 }
 
 /// Identity conversions for known leaf types. Deliberately NOT a blanket
-/// `impl<T> MapFrom<T> for T` — that overlaps the `Option`/`Vec` wrappers and
+/// `impl<T> TryMapFrom<T> for T` — that overlaps the `Option`/`Vec` wrappers and
 /// fails coherence. Add a new leaf in one line.
 macro_rules! leaf_identity {
     ($($t:ty),* $(,)?) => {$(
+        impl TryMapFrom<$t> for $t {
+            fn try_map_from(src: $t) -> Result<Self, MappingError> { Ok(src) }
+        }
         impl MapFrom<$t> for $t {
-            fn map_from(src: $t) -> Result<Self, MappingError> { Ok(src) }
+            fn map_from(src: $t) -> Self { src }
         }
     )*};
 }
@@ -237,10 +278,13 @@ leaf_identity!(serde_json::Value);
 /// is visible.
 macro_rules! leaf_widen {
     ($($s:ty => $d:ty),+ $(,)?) => {$(
-        impl MapFrom<$s> for $d {
-            fn map_from(src: $s) -> Result<Self, MappingError> {
+        impl TryMapFrom<$s> for $d {
+            fn try_map_from(src: $s) -> Result<Self, MappingError> {
                 Ok(<$d>::from(src))
             }
+        }
+        impl MapFrom<$s> for $d {
+            fn map_from(src: $s) -> Self { <$d>::from(src) }
         }
     )+};
 }
@@ -254,16 +298,27 @@ leaf_widen!(
     f32 => f64,
 );
 
-impl<S, D: MapFrom<S>> MapFrom<Option<S>> for Option<D> {
-    fn map_from(src: Option<S>) -> Result<Self, MappingError> {
+impl<S, D: TryMapFrom<S>> TryMapFrom<Option<S>> for Option<D> {
+    fn try_map_from(src: Option<S>) -> Result<Self, MappingError> {
         match src {
-            Some(s) => Ok(Some(D::map_from(s)?)),
+            Some(s) => Ok(Some(D::try_map_from(s)?)),
             None => Ok(None),
         }
     }
 }
+impl<S, D: TryMapFrom<S>> TryMapFrom<Vec<S>> for Vec<D> {
+    fn try_map_from(src: Vec<S>) -> Result<Self, MappingError> {
+        src.into_iter().map(D::try_map_from).collect()
+    }
+}
+
+impl<S, D: MapFrom<S>> MapFrom<Option<S>> for Option<D> {
+    fn map_from(src: Option<S>) -> Self {
+        src.map(D::map_from)
+    }
+}
 impl<S, D: MapFrom<S>> MapFrom<Vec<S>> for Vec<D> {
-    fn map_from(src: Vec<S>) -> Result<Self, MappingError> {
+    fn map_from(src: Vec<S>) -> Self {
         src.into_iter().map(D::map_from).collect()
     }
 }
@@ -272,61 +327,71 @@ impl<S, D: MapFrom<S>> MapFrom<Vec<S>> for Vec<D> {
 
 #[cfg(feature = "uuid")]
 mod uuid_leaves {
-    use super::{MapFrom, MappingError};
+    use super::{MapFrom, MappingError, TryMapFrom};
     use uuid::Uuid;
 
-    impl MapFrom<String> for Uuid {
-        fn map_from(src: String) -> Result<Self, MappingError> {
+    impl TryMapFrom<String> for Uuid {
+        fn try_map_from(src: String) -> Result<Self, MappingError> {
             Uuid::parse_str(&src).map_err(|_| MappingError::InvalidUuid { field: "<uuid>" })
         }
     }
-    impl MapFrom<Uuid> for String {
-        fn map_from(src: Uuid) -> Result<Self, MappingError> {
+    impl TryMapFrom<Uuid> for String {
+        fn try_map_from(src: Uuid) -> Result<Self, MappingError> {
             Ok(src.to_string())
+        }
+    }
+    impl MapFrom<Uuid> for String {
+        fn map_from(src: Uuid) -> Self {
+            src.to_string()
         }
     }
 }
 
 #[cfg(feature = "decimal")]
 mod decimal_leaves {
-    use super::{MapFrom, MappingError};
+    use super::{MapFrom, MappingError, TryMapFrom};
     use rust_decimal::prelude::ToPrimitive;
     use rust_decimal::Decimal;
 
-    impl MapFrom<Decimal> for f64 {
-        fn map_from(src: Decimal) -> Result<Self, MappingError> {
+    impl TryMapFrom<Decimal> for f64 {
+        fn try_map_from(src: Decimal) -> Result<Self, MappingError> {
             src.to_f64()
                 .ok_or(MappingError::OutOfRange { field: "<decimal>" })
         }
     }
-    impl MapFrom<f64> for Decimal {
-        fn map_from(src: f64) -> Result<Self, MappingError> {
+    impl TryMapFrom<f64> for Decimal {
+        fn try_map_from(src: f64) -> Result<Self, MappingError> {
             // NaN/±inf error out rather than silently dropping the value; JSON
             // can't carry them anyway, so API paths never hit this.
             Decimal::from_f64_retain(src).ok_or(MappingError::OutOfRange { field: "<decimal>" })
         }
     }
-    impl MapFrom<String> for Decimal {
-        fn map_from(src: String) -> Result<Self, MappingError> {
+    impl TryMapFrom<String> for Decimal {
+        fn try_map_from(src: String) -> Result<Self, MappingError> {
             src.parse()
                 .map_err(|_| MappingError::Parse { field: "<decimal>" })
         }
     }
-    impl MapFrom<Decimal> for String {
-        fn map_from(src: Decimal) -> Result<Self, MappingError> {
+    impl TryMapFrom<Decimal> for String {
+        fn try_map_from(src: Decimal) -> Result<Self, MappingError> {
             Ok(src.to_string())
+        }
+    }
+    impl MapFrom<Decimal> for String {
+        fn map_from(src: Decimal) -> Self {
+            src.to_string()
         }
     }
 }
 
 #[cfg(feature = "chrono")]
 mod chrono_leaves {
-    use super::{MapFrom, MappingError};
+    use super::{MappingError, TryMapFrom};
     use chrono::{DateTime, NaiveDate, Utc};
 
     /// Canonical wire format for timestamps is rfc3339.
-    impl MapFrom<String> for DateTime<Utc> {
-        fn map_from(src: String) -> Result<Self, MappingError> {
+    impl TryMapFrom<String> for DateTime<Utc> {
+        fn try_map_from(src: String) -> Result<Self, MappingError> {
             DateTime::parse_from_rfc3339(&src)
                 .map(|dt| dt.with_timezone(&Utc))
                 .map_err(|_| MappingError::Parse {
@@ -334,9 +399,14 @@ mod chrono_leaves {
                 })
         }
     }
-    impl MapFrom<DateTime<Utc>> for String {
-        fn map_from(src: DateTime<Utc>) -> Result<Self, MappingError> {
+    impl TryMapFrom<DateTime<Utc>> for String {
+        fn try_map_from(src: DateTime<Utc>) -> Result<Self, MappingError> {
             Ok(src.to_rfc3339())
+        }
+    }
+    impl super::MapFrom<DateTime<Utc>> for String {
+        fn map_from(src: DateTime<Utc>) -> Self {
+            src.to_rfc3339()
         }
     }
 
@@ -367,10 +437,10 @@ pub struct MapPair<S, D>(pub Option<S>, pub Option<D>);
 pub trait MapFieldOpt<D> {
     fn map_field_or(self) -> Result<D, MappingError>;
 }
-impl<S, D: MapFrom<S>> MapFieldOpt<D> for &mut &mut &mut MapPair<Option<S>, D> {
+impl<S, D: TryMapFrom<S>> MapFieldOpt<D> for &mut &mut &mut MapPair<Option<S>, D> {
     fn map_field_or(self) -> Result<D, MappingError> {
         match self.0.take().expect("magic_map field consumed twice") {
-            Some(s) => D::map_from(s),
+            Some(s) => D::try_map_from(s),
             None => Ok(self.1.take().expect("magic_map fallback consumed twice")),
         }
     }
@@ -380,9 +450,9 @@ impl<S, D: MapFrom<S>> MapFieldOpt<D> for &mut &mut &mut MapPair<Option<S>, D> {
 pub trait MapFieldVal<D> {
     fn map_field_or(self) -> Result<D, MappingError>;
 }
-impl<S, D: MapFrom<S>> MapFieldVal<D> for &mut &mut MapPair<S, D> {
+impl<S, D: TryMapFrom<S>> MapFieldVal<D> for &mut &mut MapPair<S, D> {
     fn map_field_or(self) -> Result<D, MappingError> {
-        D::map_from(self.0.take().expect("magic_map field consumed twice"))
+        D::try_map_from(self.0.take().expect("magic_map field consumed twice"))
     }
 }
 
@@ -390,47 +460,59 @@ impl<S, D: MapFrom<S>> MapFieldVal<D> for &mut &mut MapPair<S, D> {
 pub trait MapFieldWrap<D> {
     fn map_field_or(self) -> Result<D, MappingError>;
 }
-impl<S, U: MapFrom<S>> MapFieldWrap<Option<U>> for &mut MapPair<S, Option<U>> {
+impl<S, U: TryMapFrom<S>> MapFieldWrap<Option<U>> for &mut MapPair<S, Option<U>> {
     fn map_field_or(self) -> Result<Option<U>, MappingError> {
         let src = self.0.take().expect("magic_map field consumed twice");
-        Ok(Some(U::map_from(src)?))
+        Ok(Some(U::try_map_from(src)?))
     }
 }
 
-/// `map_identity!(MyEnum);` — `MapFrom<MyEnum> for MyEnum`, so same-typed
-/// fields automap (model→model moves, e.g. invite→update). Declare next to
-/// the type; the orphan rule keeps it in the owning crate.
+/// `map_identity!(MyEnum);` — `TryMapFrom<MyEnum> for MyEnum` plus its
+/// infallible `MapFrom` twin (an identity cannot fail), so same-typed fields
+/// automap in both funnels (model→model moves, e.g. invite→update). Declare
+/// next to the type; the orphan rule keeps it in the owning crate.
 #[macro_export]
 macro_rules! map_identity {
     ($($t:ty),+ $(,)?) => {$(
-        impl $crate::MapFrom<$t> for $t {
-            fn map_from(src: $t) -> ::core::result::Result<Self, $crate::MappingError> {
+        impl $crate::TryMapFrom<$t> for $t {
+            fn try_map_from(src: $t) -> ::core::result::Result<Self, $crate::MappingError> {
                 Ok(src)
             }
         }
-    )+};
-}
-
-/// `map_display!(MyEnum);` — `MapFrom<MyEnum> for String` via `Display`, so
-/// enum→string fields automap (pairs with strum's `Display` derive).
-#[macro_export]
-macro_rules! map_display {
-    ($($t:ty),+ $(,)?) => {$(
-        impl $crate::MapFrom<$t> for ::std::string::String {
-            fn map_from(src: $t) -> ::core::result::Result<Self, $crate::MappingError> {
-                Ok(src.to_string())
+        impl $crate::MapFrom<$t> for $t {
+            fn map_from(src: $t) -> Self {
+                src
             }
         }
     )+};
 }
 
-/// `map_parse!(MyEnum);` — `MapFrom<String> for MyEnum` via `FromStr`, so
+/// `map_display!(MyEnum);` — `TryMapFrom<MyEnum> for String` plus its
+/// infallible `MapFrom` twin (`Display` cannot fail), so enum→string fields
+/// automap in both funnels (pairs with strum's `Display` derive).
+#[macro_export]
+macro_rules! map_display {
+    ($($t:ty),+ $(,)?) => {$(
+        impl $crate::TryMapFrom<$t> for ::std::string::String {
+            fn try_map_from(src: $t) -> ::core::result::Result<Self, $crate::MappingError> {
+                Ok(src.to_string())
+            }
+        }
+        impl $crate::MapFrom<$t> for ::std::string::String {
+            fn map_from(src: $t) -> Self {
+                src.to_string()
+            }
+        }
+    )+};
+}
+
+/// `map_parse!(MyEnum);` — `TryMapFrom<String> for MyEnum` via `FromStr`, so
 /// string→enum fields automap strictly (pairs with strum's `EnumString`).
 #[macro_export]
 macro_rules! map_parse {
     ($($t:ty),+ $(,)?) => {$(
-        impl $crate::MapFrom<::std::string::String> for $t {
-            fn map_from(src: ::std::string::String) -> ::core::result::Result<Self, $crate::MappingError> {
+        impl $crate::TryMapFrom<::std::string::String> for $t {
+            fn try_map_from(src: ::std::string::String) -> ::core::result::Result<Self, $crate::MappingError> {
                 src.parse().map_err(|_| $crate::MappingError::Parse {
                     field: ::core::stringify!($t),
                 })
@@ -441,11 +523,11 @@ macro_rules! map_parse {
 
 // ── Crate-local funnel for foreign→foreign mappings ─────────────────────────
 //
-// The fn form exists because `impl MapFrom<Src> for Dest` is only legal in a
+// The fn form exists because `impl TryMapFrom<Src> for Dest` is only legal in a
 // crate owning one of the two types. But a mapping's *fields* funnelled through
-// `MapFrom` too, so a nested field whose own mapping was also foreign→foreign
+// `TryMapFrom` too, so a nested field whose own mapping was also foreign→foreign
 // had nothing to resolve against: `Vec<Address>` → `Vec<AddressResponse>` needs
-// `AddressResponse: MapFrom<Address>`, and that impl cannot exist anywhere.
+// `AddressResponse: TryMapFrom<Address>`, and that impl cannot exist anywhere.
 //
 // `magic_map_scope!` plants a trait in the *calling* crate. The orphan rule is
 // satisfied by a local trait just as well as by a local type, so
@@ -456,11 +538,11 @@ macro_rules! map_parse {
 // `LocalMapFrom` impl, leaves included. Two dead ends forced that, both worth
 // knowing before anyone tries to "simplify" this:
 //
-//   * A blanket bridge `impl<S, D: MapFrom<S>> LocalMapFrom<S> for D` overlaps
+//   * A blanket bridge `impl<S, D: TryMapFrom<S>> LocalMapFrom<S> for D` overlaps
 //     the per-pair impls and coherence rejects it — "upstream crates may add a
-//     new impl of `MapFrom<Address>` for `AddressResponse` in future versions".
+//     new impl of `TryMapFrom<Address>` for `AddressResponse` in future versions".
 //
-//   * Nor can a second, `MapFrom`-backed tier sit underneath to catch leaves.
+//   * Nor can a second, `TryMapFrom`-backed tier sit underneath to catch leaves.
 //     Autoref tiering needs the tiers told apart by receiver SHAPE (as
 //     `MapFieldOpt`/`MapFieldVal`/`MapFieldWrap` are); a tier separated only by
 //     a where-bound hard-errors rather than falling through. A concrete
@@ -487,7 +569,7 @@ macro_rules! map_parse {
 ///
 /// Needed only for the fn form. A crate whose mappings are all impl form
 /// (`magic_map!(Src => Dest)`, where one side is local) never calls it — those
-/// funnel through `MapFrom` as they always have. Missing it reads as
+/// funnel through `TryMapFrom` as they always have. Missing it reads as
 /// ``could not find `__magic_map_scope` in the crate root``.
 ///
 /// # Reaching your leaves
@@ -508,7 +590,7 @@ macro_rules! map_parse {
 ///     leaves_from: [quickedge_db],
 ///     leaves: [Celsius, Celsius => String],
 ///     generic_leaves: {
-///         <S, D> Patch<S> => Patch<D> where D: ::magic_map::MapFrom<S>;
+///         <S, D> Patch<S> => Patch<D> where D: ::magic_map::TryMapFrom<S>;
 ///     },
 /// }
 /// ```
@@ -543,23 +625,25 @@ macro_rules! magic_map_scope {
             #[allow(unused_imports)]
             use super::*;
 
-            /// Crate-local twin of [`magic_map::MapFrom`]. The fn form
-            /// implements it for pairs the orphan rule keeps off `MapFrom`;
+            /// Crate-local twin of [`magic_map::TryMapFrom`]. The fn form
+            /// implements it for pairs the orphan rule keeps off `TryMapFrom`;
             /// leaves are delegated in below.
-            pub trait LocalMapFrom<S>: Sized {
-                fn local_map_from(src: S) -> ::core::result::Result<Self, $crate::MappingError>;
+            pub trait LocalTryMapFrom<S>: Sized {
+                fn local_try_map_from(
+                    src: S,
+                ) -> ::core::result::Result<Self, $crate::MappingError>;
             }
 
-            impl<S, D: LocalMapFrom<S>> LocalMapFrom<::core::option::Option<S>>
+            impl<S, D: LocalTryMapFrom<S>> LocalTryMapFrom<::core::option::Option<S>>
                 for ::core::option::Option<D>
             {
-                fn local_map_from(
+                fn local_try_map_from(
                     src: ::core::option::Option<S>,
                 ) -> ::core::result::Result<Self, $crate::MappingError> {
                     match src {
                         ::core::option::Option::Some(s) => {
                             ::core::result::Result::Ok(::core::option::Option::Some(
-                                D::local_map_from(s)?,
+                                D::local_try_map_from(s)?,
                             ))
                         }
                         ::core::option::Option::None => {
@@ -569,10 +653,36 @@ macro_rules! magic_map_scope {
                 }
             }
 
-            impl<S, D: LocalMapFrom<S>> LocalMapFrom<::std::vec::Vec<S>> for ::std::vec::Vec<D> {
-                fn local_map_from(
+            impl<S, D: LocalTryMapFrom<S>> LocalTryMapFrom<::std::vec::Vec<S>>
+                for ::std::vec::Vec<D>
+            {
+                fn local_try_map_from(
                     src: ::std::vec::Vec<S>,
                 ) -> ::core::result::Result<Self, $crate::MappingError> {
+                    src.into_iter().map(D::local_try_map_from).collect()
+                }
+            }
+
+            /// Crate-local twin of [`magic_map::MapFrom`] — the infallible
+            /// funnel. Like its fallible sibling it is a CLOSED WORLD: only
+            /// infallible fn-form mappings and leaves that genuinely cannot
+            /// fail are delegated in, which is what lets an `infallible`
+            /// fn-form mapping nest another foreign→foreign mapping without
+            /// giving up the no-`?` check.
+            pub trait LocalMapFrom<S>: Sized {
+                fn local_map_from(src: S) -> Self;
+            }
+
+            impl<S, D: LocalMapFrom<S>> LocalMapFrom<::core::option::Option<S>>
+                for ::core::option::Option<D>
+            {
+                fn local_map_from(src: ::core::option::Option<S>) -> Self {
+                    src.map(D::local_map_from)
+                }
+            }
+
+            impl<S, D: LocalMapFrom<S>> LocalMapFrom<::std::vec::Vec<S>> for ::std::vec::Vec<D> {
+                fn local_map_from(src: ::std::vec::Vec<S>) -> Self {
                     src.into_iter().map(D::local_map_from).collect()
                 }
             }
@@ -588,12 +698,12 @@ macro_rules! magic_map_scope {
             pub trait LocalFieldOpt<D> {
                 fn local_map_field_or(self) -> ::core::result::Result<D, $crate::MappingError>;
             }
-            impl<S, D: LocalMapFrom<S>> LocalFieldOpt<D>
+            impl<S, D: LocalTryMapFrom<S>> LocalFieldOpt<D>
                 for &mut &mut &mut $crate::MapPair<::core::option::Option<S>, D>
             {
                 fn local_map_field_or(self) -> ::core::result::Result<D, $crate::MappingError> {
                     match self.0.take().expect("magic_map field consumed twice") {
-                        ::core::option::Option::Some(s) => D::local_map_from(s),
+                        ::core::option::Option::Some(s) => D::local_try_map_from(s),
                         ::core::option::Option::None => ::core::result::Result::Ok(
                             self.1.take().expect("magic_map fallback consumed twice"),
                         ),
@@ -604,16 +714,16 @@ macro_rules! magic_map_scope {
             pub trait LocalFieldVal<D> {
                 fn local_map_field_or(self) -> ::core::result::Result<D, $crate::MappingError>;
             }
-            impl<S, D: LocalMapFrom<S>> LocalFieldVal<D> for &mut &mut $crate::MapPair<S, D> {
+            impl<S, D: LocalTryMapFrom<S>> LocalFieldVal<D> for &mut &mut $crate::MapPair<S, D> {
                 fn local_map_field_or(self) -> ::core::result::Result<D, $crate::MappingError> {
-                    D::local_map_from(self.0.take().expect("magic_map field consumed twice"))
+                    D::local_try_map_from(self.0.take().expect("magic_map field consumed twice"))
                 }
             }
 
             pub trait LocalFieldWrap<D> {
                 fn local_map_field_or(self) -> ::core::result::Result<D, $crate::MappingError>;
             }
-            impl<S, U: LocalMapFrom<S>> LocalFieldWrap<::core::option::Option<U>>
+            impl<S, U: LocalTryMapFrom<S>> LocalFieldWrap<::core::option::Option<U>>
                 for &mut $crate::MapPair<S, ::core::option::Option<U>>
             {
                 fn local_map_field_or(
@@ -621,36 +731,66 @@ macro_rules! magic_map_scope {
                 ) -> ::core::result::Result<::core::option::Option<U>, $crate::MappingError>
                 {
                     let src = self.0.take().expect("magic_map field consumed twice");
-                    ::core::result::Result::Ok(::core::option::Option::Some(U::local_map_from(
-                        src,
-                    )?))
+                    ::core::result::Result::Ok(::core::option::Option::Some(
+                        U::local_try_map_from(src)?,
+                    ))
                 }
             }
         }
     };
 }
 
-/// Delegates one `MapFrom` pair into the local trait. Used by
+/// Delegates one `TryMapFrom` pair into the local fallible trait. Used by
 /// `magic_map_scope!` for both the built-in leaves and the `leaves: [...]`
-/// list; the body is a plain call, so a missing `MapFrom` impl fails here and
+/// list; the body is a plain call, so a missing `TryMapFrom` impl fails here and
 /// names the pair.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __magic_map_scope_delegate {
     ($src:ty => $dest:ty) => {
-        impl LocalMapFrom<$src> for $dest {
-            fn local_map_from(src: $src) -> ::core::result::Result<Self, $crate::MappingError> {
-                <$dest as $crate::MapFrom<$src>>::map_from(src)
+        impl LocalTryMapFrom<$src> for $dest {
+            fn local_try_map_from(src: $src) -> ::core::result::Result<Self, $crate::MappingError> {
+                <$dest as $crate::TryMapFrom<$src>>::try_map_from(src)
             }
         }
     };
 }
 
-/// The `leaves: [...]` entries. A bare type is its identity.
+/// Delegates one `MapFrom` pair into the local infallible trait — and into the
+/// fallible one, so an infallible leaf serves both funnels from a single
+/// declaration. A pair that is not actually infallible fails here on the
+/// missing `MapFrom` impl, naming both types.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __magic_map_scope_delegate_infallible {
+    ($src:ty => $dest:ty) => {
+        impl LocalMapFrom<$src> for $dest {
+            fn local_map_from(src: $src) -> Self {
+                <$dest as $crate::MapFrom<$src>>::map_from(src)
+            }
+        }
+        impl LocalTryMapFrom<$src> for $dest {
+            fn local_try_map_from(src: $src) -> ::core::result::Result<Self, $crate::MappingError> {
+                ::core::result::Result::Ok(<$dest as $crate::MapFrom<$src>>::map_from(src))
+            }
+        }
+    };
+}
+
+/// The `leaves: [...]` entries. A bare type is its identity (infallible by
+/// definition); `infallible Src => Dest` requires a `MapFrom` route and feeds
+/// both funnels; a plain `Src => Dest` delegates fallibly.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __magic_map_scope_extra_leaves {
     () => {};
+    (infallible $src:ty => $dest:ty, $($rest:tt)*) => {
+        $crate::__magic_map_scope_delegate_infallible!($src => $dest);
+        $crate::__magic_map_scope_extra_leaves!($($rest)*);
+    };
+    (infallible $src:ty => $dest:ty $(,)?) => {
+        $crate::__magic_map_scope_delegate_infallible!($src => $dest);
+    };
     ($src:ty => $dest:ty, $($rest:tt)*) => {
         $crate::__magic_map_scope_delegate!($src => $dest);
         $crate::__magic_map_scope_extra_leaves!($($rest)*);
@@ -659,11 +799,11 @@ macro_rules! __magic_map_scope_extra_leaves {
         $crate::__magic_map_scope_delegate!($src => $dest);
     };
     ($t:ty, $($rest:tt)*) => {
-        $crate::__magic_map_scope_delegate!($t => $t);
+        $crate::__magic_map_scope_delegate_infallible!($t => $t);
         $crate::__magic_map_scope_extra_leaves!($($rest)*);
     };
     ($t:ty $(,)?) => {
-        $crate::__magic_map_scope_delegate!($t => $t);
+        $crate::__magic_map_scope_delegate_infallible!($t => $t);
     };
 }
 
@@ -681,9 +821,11 @@ macro_rules! __magic_map_scope_generic_leaves {
     (
         < $($gen:tt),* $(,)? > $src:ty => $dest:ty ; $($rest:tt)*
     ) => {
-        impl< $($gen),* > LocalMapFrom<$src> for $dest {
-            fn local_map_from(src: $src) -> ::core::result::Result<Self, $crate::MappingError> {
-                <$dest as $crate::MapFrom<$src>>::map_from(src)
+        impl< $($gen),* > LocalTryMapFrom<$src> for $dest {
+            fn local_try_map_from(
+                src: $src,
+            ) -> ::core::result::Result<Self, $crate::MappingError> {
+                <$dest as $crate::TryMapFrom<$src>>::try_map_from(src)
             }
         }
         $crate::__magic_map_scope_generic_leaves!( $($rest)* );
@@ -709,9 +851,11 @@ macro_rules! __magic_map_scope_generic_one {
 #[macro_export]
 macro_rules! __magic_map_scope_generic_split {
     ( [ $($gen:tt),* ] [ $src:ty ] [ $dest:ty ] [ $($bound:tt)* ] ; $($rest:tt)* ) => {
-        impl< $($gen),* > LocalMapFrom<$src> for $dest where $($bound)* {
-            fn local_map_from(src: $src) -> ::core::result::Result<Self, $crate::MappingError> {
-                <$dest as $crate::MapFrom<$src>>::map_from(src)
+        impl< $($gen),* > LocalTryMapFrom<$src> for $dest where $($bound)* {
+            fn local_try_map_from(
+                src: $src,
+            ) -> ::core::result::Result<Self, $crate::MappingError> {
+                <$dest as $crate::TryMapFrom<$src>>::try_map_from(src)
             }
         }
         $crate::__magic_map_scope_generic_leaves!( $($rest)* );
@@ -741,15 +885,17 @@ macro_rules! __magic_map_scope_leaves {
             u8, u16, u32, u64, u128, usize, f32, f64,
             ::std::string::String,
         );
-        // Lossless widenings.
+        // Lossless widenings — infallible by definition.
         $crate::__magic_map_scope_extra_leaves!(
-            u8 => u16, u8 => u32, u8 => u64, u8 => i16, u8 => i32, u8 => i64,
-            u16 => u32, u16 => u64, u16 => i32, u16 => i64,
-            u32 => u64, u32 => i64,
-            i8 => i16, i8 => i32, i8 => i64,
-            i16 => i32, i16 => i64,
-            i32 => i64,
-            f32 => f64,
+            infallible u8 => u16, infallible u8 => u32, infallible u8 => u64,
+            infallible u8 => i16, infallible u8 => i32, infallible u8 => i64,
+            infallible u16 => u32, infallible u16 => u64,
+            infallible u16 => i32, infallible u16 => i64,
+            infallible u32 => u64, infallible u32 => i64,
+            infallible i8 => i16, infallible i8 => i32, infallible i8 => i64,
+            infallible i16 => i32, infallible i16 => i64,
+            infallible i32 => i64,
+            infallible f32 => f64,
         );
         $crate::__magic_map_scope_uuid_leaves!();
         $crate::__magic_map_scope_decimal_leaves!();
@@ -764,9 +910,9 @@ macro_rules! __magic_map_scope_leaves {
 macro_rules! __magic_map_scope_uuid_leaves {
     () => {
         $crate::__magic_map_scope_extra_leaves!(
-            ::uuid::Uuid,
-            ::std::string::String => ::uuid::Uuid,
-            ::uuid::Uuid => ::std::string::String,
+            $crate::__rx::uuid::Uuid,
+            ::std::string::String => $crate::__rx::uuid::Uuid,
+            infallible $crate::__rx::uuid::Uuid => ::std::string::String,
         );
     };
 }
@@ -783,11 +929,11 @@ macro_rules! __magic_map_scope_uuid_leaves {
 macro_rules! __magic_map_scope_decimal_leaves {
     () => {
         $crate::__magic_map_scope_extra_leaves!(
-            ::rust_decimal::Decimal,
-            ::rust_decimal::Decimal => f64,
-            f64 => ::rust_decimal::Decimal,
-            ::std::string::String => ::rust_decimal::Decimal,
-            ::rust_decimal::Decimal => ::std::string::String,
+            $crate::__rx::rust_decimal::Decimal,
+            $crate::__rx::rust_decimal::Decimal => f64,
+            f64 => $crate::__rx::rust_decimal::Decimal,
+            ::std::string::String => $crate::__rx::rust_decimal::Decimal,
+            infallible $crate::__rx::rust_decimal::Decimal => ::std::string::String,
         );
     };
 }
@@ -804,14 +950,14 @@ macro_rules! __magic_map_scope_decimal_leaves {
 macro_rules! __magic_map_scope_chrono_leaves {
     () => {
         $crate::__magic_map_scope_extra_leaves!(
-            ::chrono::DateTime<::chrono::Utc>,
-            ::chrono::NaiveDate,
-            ::chrono::NaiveDateTime,
-            ::chrono::NaiveTime,
-            ::std::string::String => ::chrono::DateTime<::chrono::Utc>,
-            ::chrono::DateTime<::chrono::Utc> => ::std::string::String,
-            ::std::string::String => ::chrono::NaiveDate,
-            ::chrono::NaiveDate => ::std::string::String,
+            $crate::__rx::chrono::DateTime<$crate::__rx::chrono::Utc>,
+            $crate::__rx::chrono::NaiveDate,
+            $crate::__rx::chrono::NaiveDateTime,
+            $crate::__rx::chrono::NaiveTime,
+            ::std::string::String => $crate::__rx::chrono::DateTime<$crate::__rx::chrono::Utc>,
+            infallible $crate::__rx::chrono::DateTime<$crate::__rx::chrono::Utc> => ::std::string::String,
+            ::std::string::String => $crate::__rx::chrono::NaiveDate,
+            infallible $crate::__rx::chrono::NaiveDate => ::std::string::String,
         );
     };
 }
@@ -827,7 +973,7 @@ macro_rules! __magic_map_scope_chrono_leaves {
 #[macro_export]
 macro_rules! __magic_map_scope_json_leaves {
     () => {
-        $crate::__magic_map_scope_extra_leaves!(::serde_json::Value);
+        $crate::__magic_map_scope_extra_leaves!($crate::__rx::serde_json::Value);
     };
 }
 #[cfg(not(feature = "json"))]
@@ -835,19 +981,4 @@ macro_rules! __magic_map_scope_json_leaves {
 #[macro_export]
 macro_rules! __magic_map_scope_json_leaves {
     () => {};
-}
-
-/// One `LocalMapFrom` impl delegating to an existing `MapFrom` pair. Emitted by
-/// a crate's replayed leaf list and by `magic_map_scope!`'s own `leaves`; the
-/// bare `LocalMapFrom` binds to whichever scope module it lands in.
-#[doc(hidden)]
-#[macro_export]
-macro_rules! __magic_map_leaf_impl {
-    ($src:ty => $dest:ty) => {
-        impl LocalMapFrom<$src> for $dest {
-            fn local_map_from(src: $src) -> ::core::result::Result<Self, $crate::MappingError> {
-                <$dest as $crate::MapFrom<$src>>::map_from(src)
-            }
-        }
-    };
 }

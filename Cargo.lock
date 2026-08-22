@@ -491,6 +491,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "magic_map_lint"
+version = "0.4.0"
+dependencies = [
+ "proc-macro2",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "magic_map_macros"
 version = "0.3.0"
 dependencies = [

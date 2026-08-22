@@ -31,7 +31,7 @@ pub fn derive_magic_map(input: TokenStream) -> TokenStream {
 /// `magic_map!` — declare a struct/enum mapping at the call site.
 ///
 /// ```ignore
-/// // impl form → `impl magic_map::MapFrom<Src> for Dest`
+/// // impl form → `impl magic_map::TryMapFrom<Src> for Dest`
 /// // (orphan rule: Src or Dest must be local to the calling crate)
 /// magic_map!(db::LicenseStatus => super::dtos::LicenseStatusDto);
 /// magic_map!(db::License => super::dtos::LicenseResponse {
@@ -39,8 +39,8 @@ pub fn derive_magic_map(input: TokenStream) -> TokenStream {
 ///     license_type: parse_license_type(&src.license_type), // custom expr
 /// });
 ///
-/// // tuple source → `impl MapFrom<(License, i64)> for LicenseResponse`;
-/// // call sites do `(license, count).map_into()?`.
+/// // tuple source → `impl TryMapFrom<(License, i64)> for LicenseResponse`;
+/// // call sites do `(license, count).try_map_into()?`.
 /// magic_map!((db::License, i64) => super::dtos::LicenseResponse {
 ///     devices_used: src.1 as i32,
 ///     license_type: parse_license_type(&src.0.license_type),
@@ -53,7 +53,7 @@ pub fn derive_magic_map(input: TokenStream) -> TokenStream {
 /// ```
 ///
 /// Every destination field without an override is auto-filled from the
-/// same-named source field through the `MapFrom` leaf funnel (identities,
+/// same-named source field through the `TryMapFrom` leaf funnel (identities,
 /// String↔Uuid, Decimal↔f64, `Option`/`Vec` wrappers, mapped enums/structs).
 /// Override expressions may use `src` (the whole source value). Enum mappings
 /// are variant-by-name and take `SrcVariant => DestVariant` rename pairs
@@ -104,7 +104,7 @@ pub fn __magic_map_expand(input: TokenStream) -> TokenStream {
 /// `magic_map_leaves!` — declare a crate's leaf conversions once, and publish
 /// the list so consumers never restate it.
 ///
-/// Call it once, in your crate root. It emits the `MapFrom` impls (the same
+/// Call it once, in your crate root. It emits the `TryMapFrom` impls (the same
 /// ones `map_identity!` / `map_display!` / `map_parse!` produce) and a hidden
 /// macro that `magic_map_scope!`'s `from:` replays — so adding a type here
 /// reaches every downstream crate with no edit on their side.
@@ -127,4 +127,28 @@ pub fn __magic_map_expand(input: TokenStream) -> TokenStream {
 pub fn magic_map_leaves(input: TokenStream) -> TokenStream {
     magic_map::leaves(parse_macro_input!(input as magic_map::LeavesInput))
         .unwrap_or_else(|e| e.to_compile_error().into())
+}
+
+/// `#[mapped]` — the attribute form of `#[derive(MagicMap)]`, plus sealing.
+///
+/// `#[mapped]` on its own is exactly the derive: it publishes the type's field
+/// names so `magic_map!` can target it.
+///
+/// `#[mapped(sealed)]` adds `#[non_exhaustive]` and a hidden all-fields
+/// constructor. From any other crate the type then has no struct expression at
+/// all, so a hand-rolled field-by-field copy in a service or a controller stops
+/// compiling — and so does `impl From<A> for T`, because that impl body cannot
+/// construct its own output either. `magic_map!` builds through the constructor
+/// and keeps working.
+///
+/// It is an attribute rather than a derive because a derive is additive-only:
+/// it sees the item and emits new items beside it, and can never put
+/// `#[non_exhaustive]` *on* it.
+///
+/// Sealing is skipped for shapes where it would mean nothing — unit and tuple
+/// structs, enums, and field-less markers like a proto `Empty`, where the only
+/// effect would be to break every `Ok(Empty {})` in the tree.
+#[proc_macro_attribute]
+pub fn mapped(attr: TokenStream, item: TokenStream) -> TokenStream {
+    magic_map::mapped(attr.into(), item.into()).unwrap_or_else(|e| e.to_compile_error().into())
 }
