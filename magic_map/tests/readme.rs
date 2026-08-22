@@ -11,7 +11,7 @@
 // `magic_map_scope!` section. Once, at the crate root, no arguments.
 magic_map::magic_map_scope!(from: [leaf_provider]);
 
-use magic_map::{TryMapInto, MappingError};
+use magic_map::{MappingError, TryMapInto};
 
 // ── Quick start ──────────────────────────────────────────────────────────────
 

@@ -17,7 +17,7 @@ magic_map::magic_map_scope! {
     },
 }
 use magic_map::magic_map;
-use magic_map::{TryMapFrom, TryMapInto, MappingError};
+use magic_map::{MappingError, TryMapFrom, TryMapInto};
 use rust_decimal::Decimal;
 use uuid::Uuid;
 

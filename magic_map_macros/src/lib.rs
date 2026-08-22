@@ -129,7 +129,6 @@ pub fn magic_map_leaves(input: TokenStream) -> TokenStream {
         .unwrap_or_else(|e| e.to_compile_error().into())
 }
 
-
 /// `#[mapped]` — the attribute form of `#[derive(MagicMap)]`, plus sealing.
 ///
 /// `#[mapped]` on its own is exactly the derive: it publishes the type's field
@@ -151,6 +150,5 @@ pub fn magic_map_leaves(input: TokenStream) -> TokenStream {
 /// effect would be to break every `Ok(Empty {})` in the tree.
 #[proc_macro_attribute]
 pub fn mapped(attr: TokenStream, item: TokenStream) -> TokenStream {
-    magic_map::mapped(attr.into(), item.into())
-        .unwrap_or_else(|e| e.to_compile_error().into())
+    magic_map::mapped(attr.into(), item.into()).unwrap_or_else(|e| e.to_compile_error().into())
 }

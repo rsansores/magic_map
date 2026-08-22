@@ -72,24 +72,11 @@ pub fn mapped(attr: TokenStream2, item: TokenStream2) -> Result<TokenStream, syn
     }
 
     // The helper attribute (`#[magic_map(export = ..)]`) is legal next to the
-    // derive but has no owner once the attribute form re-emits the item, so
-    // read it into the override and strip it.
+    // derive but has no owner once the attribute form re-emits the item:
+    // schema_for reads it (a helper beats the arg), then it is stripped.
     let mut input: DeriveInput = syn::parse2(item)?;
-    for attr in &input.attrs {
-        if attr.path().is_ident("magic_map") {
-            attr.parse_nested_meta(|meta| {
-                if meta.path.is_ident("export") {
-                    let v: syn::LitStr = meta.value()?.parse()?;
-                    export = Some(v.value());
-                    Ok(())
-                } else {
-                    Err(meta.error("expected `export = \"UniqueName\"`"))
-                }
-            })?;
-        }
-    }
-    input.attrs.retain(|a| !a.path().is_ident("magic_map"));
     let schema: TokenStream2 = schema_for(&input, sealed, export)?.into();
+    input.attrs.retain(|a| !a.path().is_ident("magic_map"));
 
     let named = match &input.data {
         Data::Struct(d) => match &d.fields {
@@ -819,16 +806,19 @@ pub fn expand(raw: TokenStream2, input: ExpandInput) -> Result<TokenStream, syn:
                         quote! { map_field_or },
                     )
                 };
-                assigns.push((f.clone(), quote! { {
-                    use #opt;
-                    use #val;
-                    use #wrap;
-                    (&mut &mut &mut ::magic_map::MapPair(
-                        ::core::option::Option::Some(#access),
-                        ::core::option::Option::Some(__magic_fb.#f),
-                    ))
-                        .#probe()?
-                } }));
+                assigns.push((
+                    f.clone(),
+                    quote! { {
+                        use #opt;
+                        use #val;
+                        use #wrap;
+                        (&mut &mut &mut ::magic_map::MapPair(
+                            ::core::option::Option::Some(#access),
+                            ::core::option::Option::Some(__magic_fb.#f),
+                        ))
+                            .#probe()?
+                    } },
+                ));
             } else if infallible && local {
                 // The fn form funnels through the crate-local *infallible*
                 // trait, which only infallible fn-form mappings and infallible
@@ -841,7 +831,10 @@ pub fn expand(raw: TokenStream2, input: ExpandInput) -> Result<TokenStream, syn:
                 ));
             } else if infallible {
                 // Same check through the global infallible funnel.
-                assigns.push((f.clone(), quote! { ::magic_map::MapFrom::map_from(#access) }));
+                assigns.push((
+                    f.clone(),
+                    quote! { ::magic_map::MapFrom::map_from(#access) },
+                ));
             } else if local {
                 assigns.push((
                     f.clone(),
@@ -850,7 +843,10 @@ pub fn expand(raw: TokenStream2, input: ExpandInput) -> Result<TokenStream, syn:
                     },
                 ));
             } else {
-                assigns.push((f.clone(), quote! { ::magic_map::TryMapFrom::try_map_from(#access)? }));
+                assigns.push((
+                    f.clone(),
+                    quote! { ::magic_map::TryMapFrom::try_map_from(#access)? },
+                ));
             }
         }
         let trailer = defaulted.then(|| quote! { ..::core::default::Default::default() });
@@ -1024,8 +1020,8 @@ impl Parse for LeavesInput {
                     while !content.is_empty() {
                         // `infallible` marks a pair that carries a `MapFrom`
                         // route; contextual keyword, same as in `magic_map!`.
-                        let infallible = content.peek(Ident)
-                            && content.fork().parse::<Ident>()? == "infallible";
+                        let infallible =
+                            content.peek(Ident) && content.fork().parse::<Ident>()? == "infallible";
                         if infallible {
                             content.parse::<Ident>()?;
                         }

@@ -82,7 +82,7 @@
 use std::error::Error;
 use std::fmt;
 
-pub use magic_map_macros::{magic_map, magic_map_leaves, MagicMap, mapped};
+pub use magic_map_macros::{magic_map, magic_map_leaves, mapped, MagicMap};
 
 #[doc(hidden)]
 pub use magic_map_macros::__magic_map_expand;
@@ -327,7 +327,7 @@ impl<S, D: MapFrom<S>> MapFrom<Vec<S>> for Vec<D> {
 
 #[cfg(feature = "uuid")]
 mod uuid_leaves {
-    use super::{MapFrom, TryMapFrom, MappingError};
+    use super::{MapFrom, MappingError, TryMapFrom};
     use uuid::Uuid;
 
     impl TryMapFrom<String> for Uuid {
@@ -349,7 +349,7 @@ mod uuid_leaves {
 
 #[cfg(feature = "decimal")]
 mod decimal_leaves {
-    use super::{MapFrom, TryMapFrom, MappingError};
+    use super::{MapFrom, MappingError, TryMapFrom};
     use rust_decimal::prelude::ToPrimitive;
     use rust_decimal::Decimal;
 
@@ -386,7 +386,7 @@ mod decimal_leaves {
 
 #[cfg(feature = "chrono")]
 mod chrono_leaves {
-    use super::{TryMapFrom, MappingError};
+    use super::{MappingError, TryMapFrom};
     use chrono::{DateTime, NaiveDate, Utc};
 
     /// Canonical wire format for timestamps is rfc3339.
@@ -749,9 +749,7 @@ macro_rules! magic_map_scope {
 macro_rules! __magic_map_scope_delegate {
     ($src:ty => $dest:ty) => {
         impl LocalTryMapFrom<$src> for $dest {
-            fn local_try_map_from(
-                src: $src,
-            ) -> ::core::result::Result<Self, $crate::MappingError> {
+            fn local_try_map_from(src: $src) -> ::core::result::Result<Self, $crate::MappingError> {
                 <$dest as $crate::TryMapFrom<$src>>::try_map_from(src)
             }
         }
@@ -772,9 +770,7 @@ macro_rules! __magic_map_scope_delegate_infallible {
             }
         }
         impl LocalTryMapFrom<$src> for $dest {
-            fn local_try_map_from(
-                src: $src,
-            ) -> ::core::result::Result<Self, $crate::MappingError> {
+            fn local_try_map_from(src: $src) -> ::core::result::Result<Self, $crate::MappingError> {
                 ::core::result::Result::Ok(<$dest as $crate::MapFrom<$src>>::map_from(src))
             }
         }
@@ -985,19 +981,4 @@ macro_rules! __magic_map_scope_json_leaves {
 #[macro_export]
 macro_rules! __magic_map_scope_json_leaves {
     () => {};
-}
-
-/// One `LocalMapFrom` impl delegating to an existing `TryMapFrom` pair. Emitted by
-/// a crate's replayed leaf list and by `magic_map_scope!`'s own `leaves`; the
-/// bare `LocalMapFrom` binds to whichever scope module it lands in.
-#[doc(hidden)]
-#[macro_export]
-macro_rules! __magic_map_leaf_impl {
-    ($src:ty => $dest:ty) => {
-        impl LocalMapFrom<$src> for $dest {
-            fn local_map_from(src: $src) -> ::core::result::Result<Self, $crate::MappingError> {
-                <$dest as $crate::TryMapFrom<$src>>::try_map_from(src)
-            }
-        }
-    };
 }

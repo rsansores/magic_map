@@ -125,18 +125,21 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
-    let allowed: BTreeSet<String> = allow_file
-        .as_deref()
-        .map(|f| {
-            std::fs::read_to_string(f)
-                .unwrap_or_else(|e| panic!("cannot read allowlist {}: {e}", f.display()))
+    let allowed: BTreeSet<String> = match allow_file.as_deref() {
+        None => BTreeSet::new(),
+        Some(f) => match std::fs::read_to_string(f) {
+            Err(e) => {
+                eprintln!("cannot read allowlist {}: {e}", f.display());
+                return ExitCode::from(2);
+            }
+            Ok(text) => text
                 .lines()
                 .map(str::trim)
                 .filter(|l| !l.is_empty() && !l.starts_with('#'))
                 .map(String::from)
-                .collect()
-        })
-        .unwrap_or_default();
+                .collect(),
+        },
+    };
 
     let mut files = Vec::new();
     for root in &roots {
@@ -187,7 +190,9 @@ fn main() -> ExitCode {
     }
 
     if violations + stale > 0 {
-        println!("{violations} conversion impl(s) outside magic_map, {stale} stale allowlist entr(ies)");
+        println!(
+            "{violations} conversion impl(s) outside magic_map, {stale} stale allowlist entr(ies)"
+        );
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
