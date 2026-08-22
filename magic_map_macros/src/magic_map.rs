@@ -26,6 +26,7 @@ use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
+use syn::spanned::Spanned;
 use syn::{Data, DeriveInput, Fields, Ident, Path, Token};
 
 // ── 1. #[derive(MagicMap)] — metadata only ───────────────────────────────────
@@ -52,20 +53,31 @@ pub fn derive(input: DeriveInput) -> Result<TokenStream, syn::Error> {
 /// determined can call it. The point is that the wrong path stops being the
 /// easy invisible one and becomes a positional call with a name that reads as
 /// an accusation in review.
+///
+/// `patch` is the companion for the one construction sealing has no answer for:
+/// a sparse update or query model built from nothing — a state transition, not
+/// a mapping, so no `magic_map!` declaration can express it. It emits
+/// `T::patch()` (which is `Self::default()`) plus one consuming setter per
+/// field. A whole-struct copy through it is 20 visible lines instead of one
+/// invisible `..Default::default()`, which is the whole point.
 pub fn mapped(attr: TokenStream2, item: TokenStream2) -> Result<TokenStream, syn::Error> {
     let mut sealed = false;
     let mut export = None;
+    let mut patch: Option<proc_macro2::Span> = None;
     if !attr.is_empty() {
         let parser = syn::meta::parser(|meta| {
             if meta.path.is_ident("sealed") {
                 sealed = true;
+                Ok(())
+            } else if meta.path.is_ident("patch") {
+                patch = Some(meta.path.span());
                 Ok(())
             } else if meta.path.is_ident("export") {
                 let v: syn::LitStr = meta.value()?.parse()?;
                 export = Some(v.value());
                 Ok(())
             } else {
-                Err(meta.error("expected `sealed` or `export = \"UniqueName\"`"))
+                Err(meta.error("expected `sealed`, `patch` or `export = \"UniqueName\"`"))
             }
         });
         syn::parse::Parser::parse2(parser, attr.clone())?;
@@ -120,14 +132,85 @@ pub fn mapped(attr: TokenStream2, item: TokenStream2) -> Result<TokenStream, syn
         _ => (TokenStream2::new(), TokenStream2::new()),
     };
     let (attr_tokens, ctor) = seal;
+    let patch_impl = patch_for(&input, named, patch)?;
 
     Ok(quote! {
         #attr_tokens
         #input
         #ctor
+        #patch_impl
         #schema
     }
     .into())
+}
+
+/// `#[mapped(patch)]` — `T::patch()` plus one consuming setter per field.
+///
+/// Deliberately not a separate builder type: there is nothing to validate at
+/// the end, because every field of a patch model already has a `Default`. So
+/// there is no `.build()`, and the value under construction is the type itself
+/// from the first call — a partly-filled `T` is a legal `T`.
+fn patch_for(
+    input: &DeriveInput,
+    named: Option<&syn::FieldsNamed>,
+    patch: Option<proc_macro2::Span>,
+) -> Result<TokenStream2, syn::Error> {
+    let Some(span) = patch else {
+        return Ok(TokenStream2::new());
+    };
+    // Same shapes sealing skips, and for the same reason: a tuple struct has no
+    // field names to set, an enum has no fields at all, and a marker has none.
+    let fields = match named {
+        Some(n) if !n.named.is_empty() => n,
+        _ => {
+            return Err(syn::Error::new(
+                span,
+                "`patch` needs a struct with at least one named field",
+            ))
+        }
+    };
+    // `patch()` is an inherent fn, so a field of that name would be shadowed by
+    // its own setter. Say so here rather than emit a duplicate-definition error
+    // pointing into a macro expansion.
+    if let Some(f) = fields
+        .named
+        .iter()
+        .find(|f| f.ident.as_ref().unwrap() == "patch")
+    {
+        return Err(syn::Error::new_spanned(
+            f,
+            "a field named `patch` collides with the `patch()` constructor",
+        ));
+    }
+    let name = &input.ident;
+    let (imp, ty, wher) = input.generics.split_for_impl();
+    let setters = fields.named.iter().map(|f| {
+        let id = f.ident.as_ref().unwrap();
+        let t = &f.ty;
+        let doc = format!("Set `{id}`.");
+        quote! {
+            #[doc = #doc]
+            #[must_use]
+            pub fn #id(mut self, value: #t) -> Self {
+                self.#id = value;
+                self
+            }
+        }
+    });
+    Ok(quote! {
+        impl #imp #name #ty #wher {
+            /// An empty patch — `Default::default()`. Chain the fields this
+            /// transition touches; the rest stay at their default.
+            #[must_use]
+            pub fn patch() -> Self
+            where
+                Self: Default,
+            {
+                <Self as Default>::default()
+            }
+            #(#setters)*
+        }
+    })
 }
 
 fn schema_for(

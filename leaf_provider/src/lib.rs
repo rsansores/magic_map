@@ -72,3 +72,14 @@ pub struct OpenDto {
     pub id: String,
     pub count: u64,
 }
+
+/// Sealed *and* patchable — the sparse-update shape. A foreign crate cannot
+/// write a struct expression for it, and does not need to: a state transition
+/// touches two of these fields and leaves the rest alone.
+#[magic_map::mapped(sealed, patch)]
+#[derive(Debug, PartialEq, Default)]
+pub struct SealedPatch {
+    pub id: String,
+    pub count: u64,
+    pub note: Option<String>,
+}

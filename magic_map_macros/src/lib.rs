@@ -148,6 +148,33 @@ pub fn magic_map_leaves(input: TokenStream) -> TokenStream {
 /// Sealing is skipped for shapes where it would mean nothing — unit and tuple
 /// structs, enums, and field-less markers like a proto `Empty`, where the only
 /// effect would be to break every `Ok(Empty {})` in the tree.
+///
+/// `#[mapped(sealed, patch)]` adds `T::patch()` and one consuming setter per
+/// field, for the case sealing has no other answer for: a sparse update or
+/// query model built from nothing at all — a state transition, whose values are
+/// enum literals, `now()` or a freshly generated key. That is not a mapping,
+/// so no `magic_map!` declaration can express it, and without `patch` the
+/// owning crate has to hand-write the setters.
+///
+/// ```ignore
+/// #[mapped(sealed, patch)]
+/// #[derive(Default)]
+/// pub struct UpdateDevice {
+///     pub status: Option<DeviceStatus>,
+///     pub last_seen_at: Patch<DateTime<Utc>>,
+/// }
+///
+/// // from any crate:
+/// UpdateDevice::patch().status(Some(DeviceStatus::Provisioned))
+/// ```
+///
+/// It is not a builder type and there is no `.build()`: every field of a patch
+/// model already has a `Default`, so there is nothing to validate at the end
+/// and a partly-filled `T` is a legal `T`. `patch()` requires `Self: Default`.
+///
+/// This lowers the seal rather than piercing it. A whole-struct copy is still
+/// writable as a 20-line setter chain — but it is 20 visible lines instead of
+/// one invisible `..Default::default()`, which is what sealing was ever for.
 #[proc_macro_attribute]
 pub fn mapped(attr: TokenStream, item: TokenStream) -> TokenStream {
     magic_map::mapped(attr.into(), item.into()).unwrap_or_else(|e| e.to_compile_error().into())

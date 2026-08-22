@@ -738,6 +738,47 @@ enums, and field-less markers such as a proto `Empty`.
 For the three places sealing cannot reach, there is the
 [lint](#linting--magic-map-lint).
 
+### Sparse updates — `#[mapped(sealed, patch)]`
+
+Sealing assumes every construction is a mapping. One is not: a sparse update or
+query model built from **nothing**. A state transition's values are enum
+literals, `Utc::now()`, a freshly generated key — there is no source struct, so
+no `magic_map!` declaration can express it, and sealing leaves the owning crate
+hand-writing a setter per field.
+
+`patch` generates them:
+
+```rust
+#[mapped(sealed, patch)]
+#[derive(Default)]
+pub struct UpdateDevice {
+    pub status: Option<DeviceStatus>,
+    pub last_seen_at: Patch<DateTime<Utc>>,
+    pub api_key: Patch<String>,
+}
+```
+```rust
+// from a service crate, which cannot write the struct expression:
+db.device.update(id, UpdateDevice::patch()
+    .status(Some(DeviceStatus::Provisioned))
+    .last_seen_at(Patch::Set(Utc::now()))).await?;
+```
+
+`patch()` is `Self::default()`, so the type must implement `Default`; each
+setter consumes and returns `Self`. It is **not** a builder type and there is
+no `.build()` — every field of a patch model already has a default, so there is
+nothing to validate at the end and a partly-filled `T` is a legal `T`. A field
+actually named `patch` is a compile error naming the collision.
+
+This lowers the seal; it does not pierce it. A whole-struct copy is still
+writable as a twenty-line setter chain — but twenty visible lines is not the
+failure mode sealing exists to stop. That was the single invisible
+`..Default::default()`, and it is still gone.
+
+Use `patch` where construction-from-nothing is the type's job — `Update*`,
+`*Query` — and not on types that are only ever mapping destinations, where it
+would add reachable setters for no caller.
+
 ## Linting — `magic-map-lint`
 
 Sealing is a compile-time wall, but it has three blind spots: types local to

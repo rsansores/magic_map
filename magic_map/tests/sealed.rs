@@ -56,3 +56,54 @@ fn an_unsealed_type_is_unaffected() {
 // The second is the one worth noticing: banning `impl From` needs no separate
 // mechanism, because a From impl for a sealed type cannot construct its own
 // output. Forbidding the hand-rolled map forbids the hand-rolled From with it.
+
+// ── #[mapped(sealed, patch)] ─────────────────────────────────────────────────
+// The state-transition case: a sparse update built from nothing, in a crate
+// that cannot write the struct expression for it.
+
+#[test]
+fn patch_starts_empty_and_chains_only_what_it_touches() {
+    let p = leaf_provider::SealedPatch::patch()
+        .count(7)
+        .note(Some("sold".into()));
+    assert_eq!(p.count, 7);
+    assert_eq!(p.note.as_deref(), Some("sold"));
+    // Untouched fields keep the model's Default — the point of a sparse patch.
+    assert_eq!(p.id, "");
+}
+
+#[test]
+fn patch_is_empty_by_default() {
+    assert_eq!(
+        leaf_provider::SealedPatch::patch(),
+        leaf_provider::SealedPatch::default()
+    );
+}
+
+#[test]
+fn setters_are_last_write_wins() {
+    let p = leaf_provider::SealedPatch::patch().count(1).count(2);
+    assert_eq!(p.count, 2);
+}
+
+// A sealed+patch type is still a legal magic_map destination: the declared
+// mapping goes through the hidden constructor, not the setters.
+magic_map!(Row => leaf_provider::SealedPatch { note: None });
+
+#[test]
+fn patch_does_not_disturb_declared_mappings() {
+    let p: leaf_provider::SealedPatch = Row {
+        id: "x".into(),
+        count: 2,
+    }
+    .try_map_into()
+    .unwrap();
+    assert_eq!(
+        p,
+        leaf_provider::SealedPatch::patch().id("x".into()).count(2)
+    );
+}
+
+// Still sealed. This remains E0639 from here, `patch` or no `patch`:
+//
+//     leaf_provider::SealedPatch { id: "x".into(), count: 2, note: None }
