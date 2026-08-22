@@ -81,7 +81,7 @@ touch on the [issue tracker](https://github.com/rsansores/magic_map/issues).
 
 ```toml
 [dependencies]
-magic_map = { version = "0.1", features = ["uuid", "chrono", "decimal"] }
+magic_map = { version = "0.4", features = ["uuid", "chrono", "decimal"] }
 ```
 
 Two layers that never import each other, and an empty mapping declaration —
@@ -283,9 +283,14 @@ magic_map::magic_map_leaves! {
     identity: [crate::enums::Species],
     display:  [crate::enums::Species],
     parse:    [crate::enums::Species],
-    // A pair whose impl you wrote by hand. The impl stays where it is; only
-    // the pair is registered, because a macro cannot see an impl.
-    custom:   [crate::wire::Fahrenheit => String],
+    custom: [
+        // A pair whose impl you wrote by hand. The impl stays where it is;
+        // only the pair is registered, because a macro cannot see an impl.
+        crate::wire::Fahrenheit => String,
+        // A hand impl that cannot fail is a `MapFrom` impl plus this marker —
+        // that one impl then backs both funnels, fallible and infallible.
+        infallible crate::wire::Celsius => String,
+    ],
 }
 ```
 
@@ -637,7 +642,7 @@ assert!(matches!(bad, Err(magic_map::MappingError::Validation(_))));
 Enable the feature in `Cargo.toml`:
 
 ```toml
-magic_map = { version = "0.2", features = ["validate"] }
+magic_map = { version = "0.4", features = ["validate"] }
 ```
 
 Validation runs after all field conversions succeed — a type error (e.g. a bad
@@ -678,11 +683,21 @@ The claim is checked rather than trusted: the expansion contains no `?`, so a
 field pair with only a `TryMapFrom` route fails to resolve. Infallible mappings
 also get the fallible half generated, so `try_map_into()` keeps working on them.
 
+Enum mappings can be infallible too — variant-to-variant over unit enums
+carries no decision. And infallible fn-forms **compose**: `magic_map_scope!`
+plants an infallible local funnel beside the fallible one, so an
+`infallible fn` mapping nests another foreign→foreign `infallible fn` mapping
+exactly as fallible ones always nested. What flows into that funnel is decided
+by the leaves — see [leaf fallibility](#leaf-fallibility).
+
 Sources may be borrowed:
 
 ```rust
 magic_map!(infallible fn fiscal: &CompanyPayload => FiscalFields { … });
 ```
+
+One restriction: the `..Default::default()` trailer cannot be `infallible` —
+the default funnel is fallible by construction, and the macro says so.
 
 ## Sealing — `#[mapped(sealed)]`
 
@@ -720,10 +735,52 @@ sealed type, or anything not sealed. `#[mapped]` with no argument is exactly
 `#[mapped]` skips shapes where sealing would only cost: unit and tuple structs,
 enums, and field-less markers such as a proto `Empty`.
 
+For the three places sealing cannot reach, there is the
+[lint](#linting--magic-map-lint).
+
+## Linting — `magic-map-lint`
+
+Sealing is a compile-time wall, but it has three blind spots: types local to
+the mapping crate, conversions *out of* a sealed type, and anything you chose
+not to seal. The escape hatch that grows back in all three is a hand-written
+std conversion impl — so the repo ships a linter that finds exactly that.
+
+`magic_map_lint` is a standalone binary crate (syn-based, so it tells an
+`impl` from a use and needs no compilation of your code):
+
+```sh
+cargo install magic_map_lint
+magic-map-lint --allow .magic-map-allow src/ crates/
+```
+
+It walks the given paths and flags every `impl From / Into / TryFrom /
+TryInto`, with two deliberate exemptions:
+
+- **Error conversions.** `impl From<MappingError> for ApiError` is how `?`
+  bubbles between layers; an impl where either side's type name ends in
+  `Error` is not a data mapping.
+- **The allowlist** — one rendered signature per line, `#` for comments:
+
+  ```text
+  # newtype ↔ inner ergonomics, not a layer mapping
+  impl From<Tz> for TimeZone
+  impl From<TimeZone> for Tz
+  ```
+
+  The list only shrinks: an entry that no longer matches anything fails the
+  run, so paid-off debt cannot linger and hide new violations.
+
+Exit code 1 on any violation or stale entry — wire it into your lint recipe /
+CI next to clippy. The intended division of labour: **seal** what must only be
+built by declared mappings, **lint** the conversion impls everywhere else.
+
 ## Leaves
 
-A *leaf* is a `TryMapFrom` impl for a known type pair. Identities for primitives
-and `String` ship always; third-party leaves are feature-gated:
+A *leaf* is a conversion impl for a known type pair — `TryMapFrom` always, plus
+`MapFrom` when the conversion cannot fail (identities, widenings, `Uuid`→
+`String`, `Display` routes), which is what lets it appear inside `infallible`
+mappings. Identities for primitives and `String` ship always; third-party
+leaves are feature-gated:
 
 | feature    | leaves / behavior |
 |------------|-------------------|
@@ -763,6 +820,15 @@ impl magic_map::TryMapFrom<MyWireTimestamp> for chrono::DateTime<chrono::Utc> {
 }
 ```
 
+<a name="leaf-fallibility"></a>
+**Leaf fallibility.** `map_identity!` and `map_display!` emit the infallible
+`MapFrom` twin automatically — an identity or a `Display` cannot fail — so
+those routes work inside `infallible` mappings out of the box. `map_parse!`
+stays fallible. A hand-written pair that cannot fail writes one `MapFrom` impl
+and registers with the `infallible` prefix in `magic_map_leaves!` (shown
+above); a pair left unmarked keeps working fallibly — marking is only what
+lets it serve `infallible` declarations.
+
 These automap everywhere the impl form is used. To reach them from a **fn-form**
 mapping too, declare them with [`magic_map_leaves!`](#reaching-your-leaves)
 instead — same impls, plus the published list a consumer's scope replays.
@@ -771,18 +837,27 @@ instead — same impls, plus the published list a consumer's scope replays.
 
 ## prost / generated-code recipe
 
-In `build.rs`, plant the derive on every generated type:
+In `build.rs`, plant the schema on every generated type — and seal the
+packages that are mapping *destinations*, path-scoped, so the declared mapping
+is the only way to build one outside the proto crate. Request/args/confirm
+packages stay on the plain attribute: clients assemble those from local state,
+which is parameter construction, not mapping.
 
 ```rust
 prost_build::Config::new()
-    .type_attribute(".", "#[derive(magic_map::MagicMap)]")
-    .compile_protos(&["proto/models.proto"], &["proto/"])?;
+    // model types: schema + seal — hand-rolled copies stop compiling
+    .type_attribute(".mypkg.models", "#[magic_map::mapped(sealed)]")
+    // message/args types: schema only — still constructible by clients
+    .type_attribute(".mypkg.rpc", "#[magic_map::mapped]")
+    .compile_protos(&["proto/models.proto", "proto/rpc.proto"], &["proto/"])?;
 ```
 
 Unsupported shapes (tuple structs, enums with payload variants) are a silent
-no-op, so the blanket attribute is safe. If two same-named types exist in one
-crate (e.g. `pkg_a.Sale` and `pkg_b.Sale`), disambiguate one's hidden export:
-`#[magic_map(export = "PkgASale")]`.
+no-op, and sealing skips unit/zero-field markers such as a proto `Empty`, so
+package-level attributes are safe. If two same-named types exist in one crate
+(e.g. `pkg_a.Sale` and `pkg_b.Sale`), disambiguate one's hidden export —
+either form works: `#[magic_map(export = "PkgASale")]` next to a derive, or
+`#[magic_map::mapped(sealed, export = "PkgASale")]` in one attribute.
 
 Then map proto↔db in a service crate with the fn form — no crate ever
 depends on the other's "shape".

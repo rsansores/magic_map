@@ -139,6 +139,11 @@ Word boundaries matter: they leave `map_identity!`, `map_display!`,
 `map_parse!` and `magic_map_scope!` alone. Re-exports move with everything
 else. Then build — there is nothing else to do.
 
+One dependency dividend: `magic_map_scope!` no longer expands `::uuid::Uuid`
+and friends into *your* crate — the leaf groups resolve through magic_map's
+own re-exports. A crate that only kept `uuid`, `chrono`, `rust_decimal` or
+`serde_json` as direct dependencies to satisfy the scope can drop them.
+
 ### 2. Make the conversions that cannot fail say so (optional)
 
 Add `infallible` and drop the `?`:
@@ -188,20 +193,39 @@ item the derives then see:
 pub struct CustomerDto { … }
 ```
 
-For prost, one line, and prefer a path over `"."`:
+For prost, one line per package, and prefer a path over `"."` — seal the
+model packages (mapping destinations), keep request/args packages on plain
+`#[magic_map::mapped]` (clients build those from local state, which is
+parameter construction, not mapping):
 
 ```rust
-.type_attribute(".mypkg.Customer", "#[magic_map::mapped(sealed)]")
+.type_attribute(".mypkg.models", "#[magic_map::mapped(sealed)]")
+.type_attribute(".mypkg.rpc", "#[magic_map::mapped]")
 ```
+
+An export disambiguation rides the attribute itself —
+`#[magic_map::mapped(sealed, export = "PkgASale")]` — or the old
+`#[magic_map(export = "…")]` helper next to it; both still work.
 
 `#[mapped]` with no argument is exactly `#[derive(MagicMap)]`; the derive stays
 supported, so this is per-type and can stop wherever you want.
 
-Expect a first pass to fail on real findings, not on the mechanism. Fix them by
-declaring the mapping rather than by reaching for
-`__magic_map_new_unchecked` — which is public only because a macro expansion
-holds no privilege a hand-written line lacks, and which is named to be obvious
-in review.
+Expect a first pass to fail on real findings, not on the mechanism. Most of
+what it flags falls into two buckets:
+
+- **A real hand-rolled mapping** — declare it. Do not reach for
+  `__magic_map_new_unchecked`, which is public only because a macro expansion
+  holds no privilege a hand-written line lacks, and which is named to be
+  obvious in review.
+- **Parameter construction** — query/filter structs, seed and test fixtures,
+  sparse patches, page envelopes: built from local arguments, with no source
+  type to map from. Forcing a declaration onto these puts a hand-built struct
+  next to the hand-built struct it replaced. Leave them on plain `#[mapped]`.
+  Context-like single-field types can keep the seal by growing an ordinary
+  constructor instead.
+
+Destructuring a sealed type in a pattern needs a trailing `..` —
+`#[non_exhaustive]` blocks exhaustive patterns along with construction.
 
 ### 4. Lint the escape hatch shut (optional)
 
