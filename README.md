@@ -814,11 +814,15 @@ magic-map-lint --allow .magic-map-allow src/ crates/
 ```
 
 It walks the given paths and flags every `impl From / Into / TryFrom /
-TryInto`, with two deliberate exemptions:
+TryInto`, with three deliberate exemptions:
 
 - **Error conversions.** `impl From<MappingError> for ApiError` is how `?`
   bubbles between layers; an impl where either side's type name ends in
   `Error` is not a data mapping.
+- **Widget conversions.** `impl From<Button> for Element` is how a UI toolkit
+  such as iced lets a component sit in a layout (`column![Button::new(..)]`),
+  so a design system has one per component. `From` into a type named
+  `Element` is a widget becoming what a view returns, not a data mapping.
 - **The allowlist** — one rendered signature per line, `#` for comments:
 
   ```text

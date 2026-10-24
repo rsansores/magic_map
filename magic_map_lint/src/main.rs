@@ -4,11 +4,16 @@
 //! One mapping mechanism means `From` / `Into` / `TryFrom` / `TryInto` impls
 //! are the escape hatch that grows back — a conversion written there skips
 //! the leaf funnel, the infallibility check, and sealing. This walks the
-//! given paths and flags every such impl, with two deliberate exemptions:
+//! given paths and flags every such impl, with three deliberate exemptions:
 //!
 //! * **Error conversions.** `impl From<MappingError> for ApiError` is how `?`
 //!   bubbles between layers; an impl where either side's type name ends in
 //!   `Error` is not a data mapping.
+//! * **Widget conversions.** `impl From<Button> for Element` is how a UI
+//!   toolkit (iced, and its kin) lets a component sit in a layout —
+//!   `column![Button::new(..)]` — so every component of a design system has
+//!   one. `From` into a type named `Element` is a widget becoming the thing a
+//!   view returns, not a data mapping.
 //! * **An allowlist**, one rendered signature per line (`# ` starts a
 //!   comment), for the cases that are genuinely not mappings. The file only
 //!   ever shrinks: an allowlisted signature that no longer exists fails the
@@ -66,6 +71,11 @@ fn is_error_name(name: &Option<String>) -> bool {
     name.as_deref().is_some_and(|n| n.ends_with("Error"))
 }
 
+/// `impl From<Component> for Element`: a widget becoming a view's element.
+fn is_widget_conversion(trait_name: &str, dest: &Option<String>) -> bool {
+    trait_name == "From" && dest.as_deref() == Some("Element")
+}
+
 impl Visit<'_> for Finder<'_> {
     fn visit_item_impl(&mut self, item: &syn::ItemImpl) {
         if let Some((_, trait_path, _)) = &item.trait_ {
@@ -73,7 +83,10 @@ impl Visit<'_> for Finder<'_> {
                 if CONVERSION_TRAITS.contains(&trait_name.as_str()) {
                     let source = trait_arg_name(trait_path);
                     let dest = type_name(&item.self_ty);
-                    if !is_error_name(&source) && !is_error_name(&dest) {
+                    let exempt = is_error_name(&source)
+                        || is_error_name(&dest)
+                        || is_widget_conversion(&trait_name, &dest);
+                    if !exempt {
                         let sig = format!(
                             "impl {}<{}> for {}",
                             trait_name,
@@ -196,5 +209,55 @@ fn main() -> ExitCode {
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn signatures(source: &str) -> Vec<String> {
+        let ast = syn::parse_file(source).expect("test source parses");
+        let mut finder = Finder {
+            file: Path::new("test.rs"),
+            findings: Vec::new(),
+        };
+        finder.visit_file(&ast);
+        finder.findings.into_iter().map(|f| f.signature).collect()
+    }
+
+    #[test]
+    fn a_data_conversion_is_flagged() {
+        assert_eq!(
+            signatures(
+                "impl From<UserRow> for UserDto { fn from(r: UserRow) -> Self { todo!() } }"
+            ),
+            ["impl From<UserRow> for UserDto"]
+        );
+    }
+
+    #[test]
+    fn an_error_conversion_is_exempt() {
+        assert!(signatures("impl From<MappingError> for ApiError {}").is_empty());
+    }
+
+    #[test]
+    fn a_widget_becoming_an_element_is_exempt() {
+        let source = "impl<'a, M: 'a> From<Button<'a, M>> for Element<'a, M> { \
+                      fn from(b: Button<'a, M>) -> Self { todo!() } }";
+        assert!(signatures(source).is_empty());
+        assert!(signatures("impl From<Card> for iced::Element<'static, ()> {}").is_empty());
+    }
+
+    #[test]
+    fn only_from_into_an_element_is_exempt() {
+        assert_eq!(
+            signatures("impl Into<Element> for Button {}"),
+            ["impl Into<Element> for Button"]
+        );
+        assert_eq!(
+            signatures("impl From<Element> for Snapshot {}"),
+            ["impl From<Element> for Snapshot"]
+        );
     }
 }
